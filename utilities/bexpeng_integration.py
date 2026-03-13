@@ -80,10 +80,16 @@ def get_engine():
 def _on_param_changed(param_name: str, value) -> None:
     """bexpeng subscriber: called whenever a watched parameter value changes.
 
-    Syncs ``value_store`` for every expression-driven constraint whose
+    Syncs ``value_store`` for every dimensional constraint whose
     ``param_name`` matches, then flags the solver to re-run.
+
+    This allows centrally editing a shared parameter in the BExpEng panel and
+    seeing the matching CAD Sketcher dimensions update immediately, including
+    value-source constraints (no local expression).
     """
     try:
+        target_displayed = float(value)
+
         for scene in bpy.data.scenes:
             sketcher = getattr(scene, "sketcher", None)
             if sketcher is None:
@@ -91,17 +97,27 @@ def _on_param_changed(param_name: str, value) -> None:
             for c in sketcher.constraints.all:
                 if not hasattr(c, "param_name") or c.param_name != param_name:
                     continue
-                if not getattr(c, "expression", ""):
-                    continue  # value-source constraint, not expression-driven
+                if not hasattr(c, "value_store"):
+                    continue
                 try:
                     # Store the engine's display-unit result back as internal value.
-                    c.value_store = c.from_displayed_value(float(value))
+                    target_internal = c.from_displayed_value(target_displayed)
+
+                    # Avoid redundant writes (and potential callback churn) when
+                    # the value already matches.
+                    if c.is_property_set("value_store"):
+                        current_internal = c.value_store
+                        if float(current_internal) == float(target_internal):
+                            continue
+
+                    c.value_store = target_internal
                 except Exception:
                     pass
 
         from .. import global_data
 
         global_data.needs_solve = True
+        global_data.needs_redraw = True
 
     except Exception as exc:
         logger.error("bexpeng subscriber error for '%s': %s", param_name, exc)
