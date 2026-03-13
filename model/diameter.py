@@ -9,6 +9,7 @@ from mathutils import Vector, Matrix
 from ..solver import Solver
 from ..global_data import WpReq
 from ..utilities.view import location_3d_to_region_2d
+from ..declarations import Operators
 from ..utilities.math import range_2pi, pol2cart
 from .base_constraint import DimensionalConstraint
 from .utilities import slvs_entity_pointer
@@ -37,6 +38,9 @@ class SlvsDiameter(DimensionalConstraint, PropertyGroup):
 
         if distance is not None:
             self.value_store = distance
+            from ..utilities.bexpeng_integration import push_value_to_engine
+
+            push_value_to_engine(self)
 
     @property
     def label(self):
@@ -122,6 +126,25 @@ class SlvsDiameter(DimensionalConstraint, PropertyGroup):
         coords = pol2cart(offset, self.leader_angle)
         coords2 = self.matrix_basis() @ Vector((coords[0], coords[1], 0.0))
         return location_3d_to_region_2d(region, rv3d, coords2)
+
+    def draw_props(self, layout):
+        sub = super().draw_props(layout)
+
+        sub.separator()
+        sub.use_property_split = False
+        sub.label(text="Shared Parameter:")
+        sub.prop(self, "param_name", text="")
+        sub.prop(self, "expression", text="")
+        expr = (self.expression or "").strip()
+        pname = (self.param_name or "").strip()
+        if expr and not pname:
+            sub.label(text="Set a Name to use an expression", icon="ERROR")
+
+        sub.separator()
+        props = sub.operator(Operators.DeleteConstraint, icon="X")
+        props.type = self.type
+        props.index = self.index()
+        return sub
 
 
 slvs_entity_pointer(SlvsDiameter, "entity1")

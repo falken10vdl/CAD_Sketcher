@@ -19,11 +19,13 @@ logger = logging.getLogger(__name__)
 
 class GenericConstraint:
     if bpy.app.version >= (5, 0):
+
         def _name_get_transform(self, curr_value, is_set):
             return curr_value if is_set else str(self)
 
         name: StringProperty(name="Name", get_transform=_name_get_transform)
     else:
+
         def _name_getter(self):
             return self.get("name", str(self))
 
@@ -159,15 +161,16 @@ class GenericConstraint:
 
         # Specific props
         layout.separator()
-        sub = layout.column()
 
-        # Delete
-        layout.separator()
-        props = layout.operator(Operators.DeleteConstraint, icon="X")
-        props.type = self.type
-        props.index = self.index()
+        # Geometric constraints draw Delete here. Dimensional constraints draw
+        # Shared Parameter + Delete directly in their own draw_props.
+        if not hasattr(self, "param_name"):
+            layout.separator()
+            props = layout.operator(Operators.DeleteConstraint, icon="X")
+            props.type = self.type
+            props.index = self.index()
 
-        return sub
+        return layout
 
     def index(self):
         """Return elements index inside its collection"""
@@ -192,20 +195,93 @@ class DimensionalConstraint(GenericConstraint):
     value: Property
     setting: BoolProperty
 
+    # ------------------------------------------------------------------
+    # bexpeng integration callbacks (module-level so bpy can register them)
+    # ------------------------------------------------------------------
+
+    def _on_param_name_update(self, context: Context) -> None:
+        """Re-register this constraint's parameter in bexpeng when its name changes."""
+        from ..utilities.bexpeng_integration import (
+            sync_constraint_to_engine,
+            sync_expression_to_engine,
+        )
+
+        sync_constraint_to_engine(self)
+        if (self.expression or "").strip():
+            sync_expression_to_engine(self)
+
+    def _on_expression_update(self, context: Context) -> None:
+        """Register or remove the expression in bexpeng when the field changes."""
+        from ..utilities.bexpeng_integration import sync_expression_to_engine
+
+        sync_expression_to_engine(self)
+
+    param_name: StringProperty(
+        name="Parameter Name",
+        description=(
+            "Expose this constraint's value as a named parameter in the "
+            "expression engine so other constraints can reference it "
+            "(e.g. 'wall_height').  Leave empty for no engine registration."
+        ),
+        default="",
+        update=_on_param_name_update,
+    )
+    expression: StringProperty(
+        name="Expression",
+        description=(
+            "Drive this constraint's value with an expression that "
+            "references other named parameters "
+            "(e.g. '= 2 * wall_height').  Requires Parameter Name to be set.  "
+            "Leave empty to use the value field directly."
+        ),
+        default="",
+        update=_on_expression_update,
+    )
+
+    # ------------------------------------------------------------------
+    # Value access
+    # ------------------------------------------------------------------
+
+    def _get_bexpeng_value(self):
+        """Return the engine-computed displayed value if expression-driven, else None."""
+        if not (self.expression or "").strip():
+            return None
+        param_name = (self.param_name or "").strip()
+        if not param_name:
+            return None
+        from ..utilities.bexpeng_integration import get_engine, _ensure_subscribed
+
+        engine = get_engine()
+        if engine is None:
+            return None
+        # Self-heal: re-subscribe in case we missed the load_post handler.
+        _ensure_subscribed(engine, param_name)
+        val = engine.get_value(param_name)
+        return float(val) if val is not None else None
+
     def _set_value(self, displayed_value: float):
         # NOTE: function signature _set_value(self, val: float, force=False)
         #       will fail when bpy tries to register the value property.
         #       See `_set_value_force()`
-        if not self.is_reference:
-            self._set_value_force(self.from_displayed_value(displayed_value))
+        if self.is_reference:
+            return
+        if (self.expression or "").strip():
+            return  # expression-driven; ignore manual edits
+        self._set_value_force(self.from_displayed_value(displayed_value))
 
     def _set_value_force(self, value: float):
         self.value_store = value
+        from ..utilities.bexpeng_integration import push_value_to_engine
+
+        push_value_to_engine(self)
 
     def _get_value(self):
         if self.is_reference:
             val = self.init_props()["value"]
             return self.to_displayed_value(val)
+        bexpeng_val = self._get_bexpeng_value()
+        if bexpeng_val is not None:
+            return bexpeng_val
         if not self.is_property_set("value_store"):
             self.assign_init_props()
         return self.to_displayed_value(self.value_store)
@@ -261,12 +337,11 @@ class DimensionalConstraint(GenericConstraint):
         sub = GenericConstraint.draw_props(self, layout)
         sub.prop(self, "is_reference")
         if hasattr(self, "value"):
-            col = sub.column()
-            # Could not find a way to have the property "readonly",
-            # so we disable user input instead
-            col.prop(self, "value")
-            col.enabled = not self.is_reference
-        if hasattr(self, "setting"):
+            is_driven = bool((self.expression or "").strip())
             row = sub.row()
-            row.prop(self, "setting")
+            row.prop(self, "value")
+            row.enabled = not self.is_reference and not is_driven
+        if hasattr(self, "setting"):
+            sub.prop(self, "setting")
+
         return sub

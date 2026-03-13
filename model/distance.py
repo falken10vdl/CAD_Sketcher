@@ -11,6 +11,7 @@ from ..solver import Solver
 from ..utilities import preferences
 from ..global_data import WpReq
 from ..utilities.view import location_3d_to_region_2d
+from ..declarations import Operators
 from ..utilities.math import range_2pi
 from .base_constraint import DimensionalConstraint
 from .utilities import slvs_entity_pointer
@@ -52,10 +53,14 @@ align_items = [
     ("VERTICAL", "Vertical", "", 2),
 ]
 
+
 def _get_value(self):
     if self.is_reference:
         val = self.init_props(align=self.align)["value"]
         return self.to_displayed_value(val)
+    bexpeng_val = self._get_bexpeng_value()
+    if bexpeng_val is not None:
+        return bexpeng_val
     if not self.is_property_set("value_store"):
         self.assign_init_props()
     return self.to_displayed_value(self.value_store)
@@ -72,6 +77,9 @@ class SlvsDistance(DimensionalConstraint, PropertyGroup):
         distance = _get_aligned_distance(self.entity1, self.entity2, alignment)
         self.align_store = value
         self.value_store = distance
+        from ..utilities.bexpeng_integration import push_value_to_engine
+
+        push_value_to_engine(self)
 
     def _get_align(self) -> int:
         if not self.is_property_set("align_store"):
@@ -199,18 +207,12 @@ class SlvsDistance(DimensionalConstraint, PropertyGroup):
 
                 p = solvesys.add_point_2d(group, *coords, wp)
 
-                handles.append(
-                    solvesys.horizontal(group, p, wp, entityB=e2.py_data)
-                )
-                handles.append(
-                    solvesys.vertical(group, p, wp, entityB=e1.py_data)
-                )
+                handles.append(solvesys.horizontal(group, p, wp, entityB=e2.py_data))
+                handles.append(solvesys.vertical(group, p, wp, entityB=e1.py_data))
 
                 base_point = e1 if alignment == "VERTICAL" else e2
                 handles.append(
-                    solvesys.distance(
-                        group, p, base_point.py_data, value, wp
-                    )
+                    solvesys.distance(group, p, base_point.py_data, value, wp)
                 )
                 return handles
             else:
@@ -286,7 +288,7 @@ class SlvsDistance(DimensionalConstraint, PropertyGroup):
 
             if v_rotation.length != 0:
                 angle = v_rotation.angle_signed(x_axis)
-                
+
             mat_rot = Matrix.Rotation(angle, 2, "Z")
             v_translation = (p2 + p1) / 2
 
@@ -304,7 +306,7 @@ class SlvsDistance(DimensionalConstraint, PropertyGroup):
                     )
                 if v_rotation.length != 0:
                     angle = v_rotation.angle_signed(x_axis)
-                
+
                 mat_rot = Matrix.Rotation(angle, 2, "Z")
                 v_translation = (p2 + p1) / 2
             else:
@@ -396,6 +398,20 @@ class SlvsDistance(DimensionalConstraint, PropertyGroup):
         if preferences.is_experimental():
             sub.prop(self, "draw_offset")
 
+        sub.separator()
+        sub.use_property_split = False
+        sub.label(text="Shared Parameter:")
+        sub.prop(self, "param_name", text="")
+        sub.prop(self, "expression", text="")
+        expr = (self.expression or "").strip()
+        pname = (self.param_name or "").strip()
+        if expr and not pname:
+            sub.label(text="Set a Name to use an expression", icon="ERROR")
+
+        sub.separator()
+        props = sub.operator(Operators.DeleteConstraint, icon="X")
+        props.type = self.type
+        props.index = self.index()
         return sub
 
     def value_placement(self, context):

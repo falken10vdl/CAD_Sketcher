@@ -12,6 +12,7 @@ from ..utilities.math import range_2pi
 from ..solver import Solver
 from ..global_data import WpReq
 from ..utilities.view import location_3d_to_region_2d
+from ..declarations import Operators
 from .base_constraint import DimensionalConstraint
 from .line_2d import SlvsLine2D
 from .utilities import slvs_entity_pointer
@@ -166,6 +167,25 @@ class SlvsAngle(DimensionalConstraint, PropertyGroup):
         co = pol2cart(offset, outset)
         coords = self.matrix_basis() @ Vector((co[0], co[1], 0))
         return location_3d_to_region_2d(region, rv3d, coords)
+
+    def draw_props(self, layout):
+        sub = super().draw_props(layout)
+
+        sub.separator()
+        sub.use_property_split = False
+        sub.label(text="Shared Parameter:")
+        sub.prop(self, "param_name", text="")
+        sub.prop(self, "expression", text="")
+        expr = (self.expression or "").strip()
+        pname = (self.param_name or "").strip()
+        if expr and not pname:
+            sub.label(text="Set a Name to use an expression", icon="ERROR")
+
+        sub.separator()
+        props = sub.operator(Operators.DeleteConstraint, icon="X")
+        props.type = self.type
+        props.index = self.index()
+        return sub
 
 
 slvs_entity_pointer(SlvsAngle, "entity1")

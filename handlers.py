@@ -79,12 +79,23 @@ def on_depsgraph_update(scene, depsgraph):
             context.space_data.show_gizmo = True
 
 
+def _on_load_post(dummy) -> None:
+    """Re-subscribe bexpeng callbacks after loading a .blend file."""
+    try:
+        from .utilities.bexpeng_integration import resync_all_constraints
+
+        resync_all_constraints()
+    except Exception as exc:
+        logger.warning("bexpeng resync after load failed: %s", exc)
+
+
 def _setup_builtin_handlers():
     from .versioning import do_versioning, write_addon_version
 
     add_builtin_handler("version_update", do_versioning)
     add_builtin_handler("save_pre", write_addon_version)
     add_builtin_handler("depsgraph_update_post", on_depsgraph_update)
+    add_builtin_handler("load_post", _on_load_post)
 
 
 def register():
