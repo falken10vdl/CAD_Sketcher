@@ -282,7 +282,7 @@ class SlvsGenericEntity:
 
     def is_visible(self, context: Context) -> bool:
         if self.origin:
-            return context.scene.sketcher.show_origin
+            return self.visible or context.scene.sketcher.show_origin
 
         if hasattr(self, "sketch"):
             return self.sketch.is_visible(context) and self.visible
