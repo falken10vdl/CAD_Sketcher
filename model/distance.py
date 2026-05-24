@@ -318,6 +318,9 @@ class SlvsDistance(DimensionalConstraint, PropertyGroup):
     def _get_init_value(self, alignment):
         e1, e2 = self.entity1, self.entity2
 
+        if e1 is None or e2 is None:
+            return 0.0
+
         if e1.is_3d():
             return (e1.location - e2.location).length
 
