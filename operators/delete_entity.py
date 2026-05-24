@@ -44,6 +44,12 @@ class View3D_OT_slvs_delete_entity(Operator, HighlightElement):
         if not entity:
             return {"CANCELLED"}
 
+        if entity.linked:
+            operator.report(
+                {"WARNING"}, "Cannot delete linked geometry: {}".format(entity.name)
+            )
+            return {"CANCELLED"}
+
         if isinstance(entity, SlvsSketch):
             if context.scene.sketcher.active_sketch_i != -1:
                 activate_sketch(context, -1, operator)
@@ -105,14 +111,29 @@ class View3D_OT_slvs_delete_entity(Operator, HighlightElement):
             for e in selected:
                 indices.append(e.slvs_index)
 
+            skipped_linked = []
             indices.sort(reverse=True)
             for i in indices:
                 e = context.scene.sketcher.entities.get(i)
+                if not e:
+                    continue
+
+                if e.linked:
+                    skipped_linked.append(e.name)
+                    continue
 
                 # NOTE: this might be slow when a lot of entities are selected, improve!
                 if is_entity_dependency(e, context):
                     continue
                 self.delete(e, context)
+
+            if skipped_linked:
+                self.report(
+                    {"WARNING"},
+                    "Cannot delete linked geometry: {}".format(
+                        ", ".join(skipped_linked)
+                    ),
+                )
 
         solve_system(context, context.scene.sketcher.active_sketch)
         refresh(context)
