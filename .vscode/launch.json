@@ -27,6 +27,7 @@
                 "host": "localhost",
                 "port": 5678
             },
+            "preLaunchTask": "Run Blender interactively",
             "pathMappings": [
                 {
                     "localRoot": "${config:cadSketcher.localRoot}",
