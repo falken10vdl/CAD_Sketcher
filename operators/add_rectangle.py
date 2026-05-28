@@ -71,6 +71,7 @@ class View3D_OT_slvs_add_rectangle(Operator, Operator2d):
 
         for e in (*points, *lines):
             ignore_hover(e)
+
         return True
 
     def fini(self, context: Context, succeede: bool):
@@ -97,8 +98,9 @@ class View3D_OT_slvs_add_rectangle(Operator, Operator2d):
                     )
 
         if succeede:
-            if self.has_coincident():
-                solve_system(context, sketch=self.sketch)
+            # Always solve after rectangle creation so sketch.dof reflects the
+            # new geometry even when no coincident constraints were added.
+            solve_system(context, sketch=self.sketch)
 
     def create_point(self, context: Context, values, state, state_data):
         value = values[0]
