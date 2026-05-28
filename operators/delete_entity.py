@@ -45,7 +45,15 @@ class View3D_OT_slvs_delete_entity(Operator, HighlightElement):
         if not entity:
             return {"CANCELLED"}
 
+        if entity.linked:
+            operator.report(
+                {"WARNING"}, "Cannot delete linked geometry: {}".format(entity.name)
+            )
+            return {"CANCELLED"}
+
         if isinstance(entity, SlvsSketch):
+            sketch_index = entity.slvs_index
+            wp_index = getattr(entity, "wp_i", -1)
             if context.scene.sketcher.active_sketch_i != -1:
                 activate_sketch(context, -1, operator)
             entity.remove_objects()
@@ -54,6 +62,20 @@ class View3D_OT_slvs_delete_entity(Operator, HighlightElement):
 
             for i in reversed(deps):
                 operator.delete(entities.get(i), context)
+
+            # Keep workplanes only when shared by another sketch.
+            should_delete_wp = wp_index != -1 and not any(
+                s.slvs_index != sketch_index and getattr(s, "wp_i", -1) == wp_index
+                for s in entities.sketches
+            )
+
+            operator.delete(entity, context)
+
+            if should_delete_wp:
+                wp_entity = entities.get(wp_index)
+                if wp_entity is not None and not getattr(wp_entity, "origin", False):
+                    View3D_OT_slvs_delete_entity.main(context, wp_index, operator)
+            return
 
         elif is_entity_dependency(entity, context):
             deps = View3D_OT_slvs_delete_entity.get_ordered_dependents(entity, context)
@@ -122,9 +144,25 @@ class View3D_OT_slvs_delete_entity(Operator, HighlightElement):
         else:
             # Batch deletion
             indices = sorted((e.slvs_index for e in selected), reverse=True)
+            skipped_linked = []
             for i in indices:
+                e = context.scene.sketcher.entities.get(i)
+                if not e:
+                    continue
+
+                if e.linked:
+                    skipped_linked.append(e.name)
+                    continue
                 # NOTE: this might be slow when a lot of entities are selected, improve!
                 self.main(context, i, self)
+
+            if skipped_linked:
+                self.report(
+                    {"WARNING"},
+                    "Cannot delete linked geometry: {}".format(
+                        ", ".join(skipped_linked)
+                    ),
+                )
 
         solve_system(context, context.scene.sketcher.active_sketch)
         refresh(context)
