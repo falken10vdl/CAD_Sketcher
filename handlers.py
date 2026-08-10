@@ -63,7 +63,7 @@ def unregister_handlers():
 
 def on_load_post(*args):
     """Migrate legacy entity-based sketches to native curves on file load."""
-    from .utilities.migrate import scene_needs_migration, migrate_scene
+    from .utilities.migrate import migrate_scene, scene_needs_migration
     from .utilities.validate import reset_cache
 
     reset_cache()
@@ -77,6 +77,37 @@ def on_load_post(*args):
             logger.info("Migrated legacy sketches to curves: %s", summary)
     except Exception:
         logger.exception("Legacy sketch migration failed")
+
+    # A file saved before the identity-weld fill (or by an older addon) carries a
+    # stale convert node group and no weld ids, so its sketches don't fill. Bring
+    # both up to date on load rather than waiting for an incidental edit.
+    try:
+        _refresh_fill_pipeline(context)
+    except Exception:
+        logger.exception("Fill pipeline refresh on load failed")
+
+
+def _refresh_fill_pipeline(context):
+    """Upgrade the convert node group and recompute weld ids for all sketches."""
+    from .model.sketch_ref import get_sketches
+    from .utilities.curve_data import compute_merge_ids
+
+    if bpy.app.version >= (5, 2, 0):
+        from .utilities.convert_nodes import build_convert_node_group
+
+        build_convert_node_group()  # rebuilds a stale group in place
+
+    scene = context.scene
+    if not scene:
+        return
+    for sketch in get_sketches(scene):
+        compute_merge_ids(sketch)
+        # Tag the curve data so the GN modifier re-evaluates and the viewport
+        # shows the (now closable) fill -- setting attributes alone doesn't
+        # trigger a redraw, so without this the fill only appears on a later edit.
+        obj = sketch.target_object
+        if obj and obj.data:
+            obj.data.update_tag()
 
 
 def on_depsgraph_update(scene, depsgraph):
@@ -143,8 +174,8 @@ def on_frame_change(scene, depsgraph=None):
         return
 
     from .curve_solver import solve_system
-    from .utilities.curve_data import refresh_curve_geometry
     from .model.sketch_ref import get_sketches
+    from .utilities.curve_data import refresh_curve_geometry
 
     context = bpy.context
     for sketch in get_sketches(scene):
