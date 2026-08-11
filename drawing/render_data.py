@@ -17,7 +17,12 @@ import numpy as np
 from mathutils import Vector
 
 from ..model.constants import SketchCurveType
-from ..utilities.curve_data import get_uuid, has_uuid_field, get_curve_data, read_uuid_list
+from ..utilities.curve_data import (
+    get_curve_data,
+    get_uuid,
+    has_uuid_field,
+    read_curve_id_list,
+)
 from ..utilities.math import range_2pi
 from . import selection
 
@@ -57,33 +62,57 @@ def curve_color(ts, selected, hover, fixed, active=True):
     return ts.default
 
 
+def geometry_signature(sketch):
+    """Fingerprint of the geometry that determines pickable positions.
+
+    Positions + the persistent curve attributes (type/construction/visible/...),
+    plus counts. Excludes transient selection/hover -- those change colours (the
+    overlay), not the projected points/segments (picking), so picking can cache
+    its extraction against this and skip rebuilding while the cursor just hovers.
+    """
+    cd = sketch.data
+    n_curves = len(cd.curves)
+    n_points = len(cd.points)
+    if n_points == 0:
+        return (0, 0, 0)
+
+    pos = np.empty(n_points * 3, dtype=np.float32)
+    cd.points.foreach_get("position", pos)
+
+    parts = [pos.tobytes()]
+    for name in ("construction", "fixed", "visible", "cyclic"):
+        parts.append(_bulk_bool(cd.attributes.get(name), n_curves).tobytes())
+    parts.append(_bulk_int(cd.attributes.get("sketch_type"), n_curves).tobytes())
+
+    return (n_curves, n_points, hash(b"".join(parts)))
+
+
 def overlay_signature(sketch, is_active, theme_sig):
     """Cheap, hashable fingerprint of everything that affects the overlay.
 
     Reading the flat attribute arrays with ``foreach_get`` is far cheaper than
     rebuilding GPU batches, so the overlay computes this every frame and only
     rebuilds when it changes.
+
+    Hover and highlight are set only by picking, which is active-only, so they
+    never reference an inactive sketch's curves. Folding them into every sketch's
+    signature made unrelated visible sketches rebuild their batches on every
+    hover change (each mouse-move). Inactive sketches therefore track only their
+    geometry and the selection set (which can still contain their curves after an
+    active-sketch switch); the per-frame hover/highlight go to the active sketch
+    alone.
     """
-    cd = sketch.data
-    n_curves = len(cd.curves)
-    n_points = len(cd.points)
-    if n_points == 0:
+    if len(sketch.data.points) == 0:
         return (0, 0, is_active, theme_sig)
 
-    pos = np.empty(n_points * 3, dtype=np.float32)
-    cd.points.foreach_get("position", pos)
-
-    # Geometry + persistent attributes (positions/construction/visible/...). The
-    # transient selected/hover state lives in the selection module, not on the
-    # datablock, so it's folded into the signature separately below.
-    parts = [pos.tobytes()]
-    for name in ("construction", "fixed", "visible", "cyclic"):
-        parts.append(_bulk_bool(cd.attributes.get(name), n_curves).tobytes())
-    parts.append(_bulk_int(cd.attributes.get("sketch_type"), n_curves).tobytes())
+    if not is_active:
+        return (geometry_signature(sketch), False, theme_sig,
+                frozenset(selection.selected))
 
     return (
-        n_curves, n_points, is_active, theme_sig,
-        hash(b"".join(parts)),
+        geometry_signature(sketch),
+        True,
+        theme_sig,
         frozenset(selection.selected),
         selection.hover,
         frozenset(selection.highlight_curve_ids),
@@ -131,7 +160,7 @@ def build(sketch, ts, is_active):
     vis = _bulk_bool(cd.attributes.get("visible"), n_curves) if cd.attributes.get("visible") else np.ones(n_curves, bool)
     cyc = _bulk_bool(cd.attributes.get("cyclic"), n_curves)
     types = _bulk_int(type_attr, n_curves)
-    cids = read_uuid_list(cd, "curve_id")
+    cids = read_curve_id_list(cd)
 
     # Selection/hover are transient runtime state (not persisted attributes).
     selected_set = set(selection.selected)
