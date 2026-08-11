@@ -90,6 +90,14 @@ def get_uuid(curve_data, field, index):
     return _pairs_to_hex(lo_v, hi_v)
 
 
+# (id(curve_data), field) -> list of hex ids. Identity fields are immutable after
+# creation, so this is invalidated only by set_uuid (a value write) and by
+# add/remove via invalidate_curve_id_cache. Serves the hot read paths (solver,
+# segment rebuild, draw/pick) without re-deriving every hex id from its int
+# attributes on each call -- the dominant cost in solve and draw (issue #342).
+_uuid_list_cache = {}
+
+
 def set_uuid(curve_data, field, index, value):
     """Write a hex-string identity field into its 2 INT32_2D sub-attributes."""
     lo_pair, hi_pair = _hex_to_pairs(value)
@@ -99,6 +107,7 @@ def set_uuid(curve_data, field, index, value):
         lo.data[index].value = lo_pair
     if hi:
         hi.data[index].value = hi_pair
+    _uuid_list_cache.pop((id(curve_data), field), None)
 
 
 def new_uuid():
@@ -107,13 +116,21 @@ def new_uuid():
 
 
 def read_uuid_list(curve_data, field):
-    """All curves' ids for a field as hex strings, read in bulk.
+    """All curves' ids for a field as hex strings, read in bulk (cached).
 
     Uses foreach_get on the 2 INT32_2D sub-attributes — far cheaper than calling
-    get_uuid() per curve in hot loops (attribute lookup happens twice total
-    instead of twice per curve).
+    get_uuid() per curve in hot loops. Memoized per (curve_data, field): identity
+    fields don't change except through set_uuid / add / remove, all of which
+    invalidate the entry, so repeated reads within a solve or across frames are
+    free. The length guard rebuilds if the curve count changed without an
+    explicit invalidation.
     """
     n = len(curve_data.curves)
+    key = (id(curve_data), field)
+    cached = _uuid_list_cache.get(key)
+    if cached is not None and len(cached) == n:
+        return cached
+
     lo = curve_data.attributes.get(f".{field}_lo")
     hi = curve_data.attributes.get(f".{field}_hi")
     if n == 0 or not lo or not hi:
@@ -122,11 +139,13 @@ def read_uuid_list(curve_data, field):
     hib = np.zeros(n * 2, dtype=np.int32)
     lo.data.foreach_get("value", lob)
     hi.data.foreach_get("value", hib)
-    return [
+    result = [
         _pairs_to_hex((int(lob[2 * i]), int(lob[2 * i + 1])),
                       (int(hib[2 * i]), int(hib[2 * i + 1])))
         for i in range(n)
     ]
+    _uuid_list_cache[key] = result
+    return result
 
 
 def default_curve_name(curve_data, ctype):
@@ -236,6 +255,11 @@ def init_string_attrs(curve_data, curve_idx):
 _curve_id_cache = {}
 
 
+def read_curve_id_list(curve_data):
+    """Cached ordered list of curve_id hex strings (see read_uuid_list)."""
+    return read_uuid_list(curve_data, "curve_id")
+
+
 def _allocate_curve_id(sketch):
     """Allocate a unique curve_id using UUID generation."""
     return secrets.token_hex(16)
@@ -266,12 +290,15 @@ def _rebuild_curve_id_cache(sketch, lookup_id=None):
 
 
 def invalidate_curve_id_cache(sketch=None):
-    """Invalidate the curve_id cache. Call after add/remove curves."""
+    """Invalidate the curve_id caches. Call after add/remove curves."""
     if sketch and sketch.target_object:
         sk_key = id(sketch.target_object.data)
         _curve_id_cache.pop(sk_key, None)
+        for field in UUID_FIELDS:
+            _uuid_list_cache.pop((sk_key, field), None)
     else:
         _curve_id_cache.clear()
+        _uuid_list_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -720,7 +747,7 @@ def rebuild_segments(sketch, point_ids=None):
     from mathutils import Vector
 
     from ..model.constants import SketchCurveType
-    from ..model.curve_ref import PointRef, _build_arc_bezier
+    from ..model.curve_ref import _build_arc_bezier
 
     if not sketch or not sketch.target_object or not sketch.target_object.data:
         return
@@ -745,6 +772,18 @@ def rebuild_segments(sketch, point_ids=None):
     ep_ids = read_uuid_list(cd, "end_point_id")
     cp_ids = read_uuid_list(cd, "center_point_id")
 
+    # Map point curve_id -> local 2D position once, so segment endpoints resolve
+    # by dict lookup instead of a PointRef per endpoint (each of which re-resolved
+    # curve data twice). This is the bulk of solve's per-edit cost (issue #342).
+    cid_list = read_uuid_list(cd, "curve_id")
+    point_co = {}
+    for i in range(n):
+        if type_attr.data[i].value == SketchCurveType.POINT:
+            cs = cd.curves[i]
+            if cs.points_length:
+                p = cd.points[cs.points[0].index].position
+                point_co[cid_list[i]] = Vector((p[0], p[1]))
+
     for i in range(n):
         ctype = type_attr.data[i].value
         if ctype == SketchCurveType.POINT:
@@ -768,46 +807,36 @@ def rebuild_segments(sketch, point_ids=None):
             continue
 
         if ctype == SketchCurveType.LINE:
-            sp_cid = sp_ids[i]
-            ep_cid = ep_ids[i]
-            if sp_cid:
-                p1 = PointRef(sketch, sp_cid)
-                if p1.valid:
-                    pos = (*p1.co, 0.0)
-                    cd.points[curve_slice.points[0].index].position = pos
-                    hl = cd.attributes.get("handle_left")
-                    hr = cd.attributes.get("handle_right")
-                    if hl: hl.data[curve_slice.points[0].index].vector = pos
-                    if hr: hr.data[curve_slice.points[0].index].vector = pos
-            if ep_cid:
-                p2 = PointRef(sketch, ep_cid)
-                if p2.valid:
-                    pos = (*p2.co, 0.0)
-                    cd.points[curve_slice.points[1].index].position = pos
-                    hl = cd.attributes.get("handle_left")
-                    hr = cd.attributes.get("handle_right")
-                    if hl: hl.data[curve_slice.points[1].index].vector = pos
-                    if hr: hr.data[curve_slice.points[1].index].vector = pos
+            sp_co = point_co.get(sp_ids[i])
+            ep_co = point_co.get(ep_ids[i])
+            hl = cd.attributes.get("handle_left")
+            hr = cd.attributes.get("handle_right")
+            if sp_co is not None:
+                pos = (sp_co.x, sp_co.y, 0.0)
+                idx = curve_slice.points[0].index
+                cd.points[idx].position = pos
+                if hl: hl.data[idx].vector = pos
+                if hr: hr.data[idx].vector = pos
+            if ep_co is not None:
+                pos = (ep_co.x, ep_co.y, 0.0)
+                idx = curve_slice.points[1].index
+                cd.points[idx].position = pos
+                if hl: hl.data[idx].vector = pos
+                if hr: hr.data[idx].vector = pos
 
         elif ctype in (SketchCurveType.ARC, SketchCurveType.CIRCLE):
-            cp_cid = cp_ids[i]
-            if not cp_cid:
-                continue
-            ct = PointRef(sketch, cp_cid)
-            if not ct.valid:
+            ct_co = point_co.get(cp_ids[i])
+            if ct_co is None:
                 continue
             is_cyclic = ctype == SketchCurveType.CIRCLE
             if is_cyclic:
                 edge = Vector(cd.points[curve_slice.points[0].index].position[:2])
-                _build_arc_bezier(cd, i, ct.co, edge, edge, is_cyclic=True)
+                _build_arc_bezier(cd, i, ct_co, edge, edge, is_cyclic=True)
             else:
-                sp_cid = sp_ids[i]
-                ep_cid = ep_ids[i]
-                if sp_cid and ep_cid:
-                    s = PointRef(sketch, sp_cid)
-                    e = PointRef(sketch, ep_cid)
-                    if s.valid and e.valid:
-                        _build_arc_bezier(cd, i, ct.co, s.co, e.co)
+                s_co = point_co.get(sp_ids[i])
+                e_co = point_co.get(ep_ids[i])
+                if s_co is not None and e_co is not None:
+                    _build_arc_bezier(cd, i, ct_co, s_co, e_co)
 
     # Weld ids depend on connectivity (start/end_point_id), not positions, so
     # only recompute on a full rebuild -- a scoped move leaves topology intact.
