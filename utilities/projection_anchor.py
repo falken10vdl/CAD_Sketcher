@@ -270,6 +270,59 @@ def update_projected_geometry(context, depsgraph):
         global_data.needs_redraw = True
 
 
+def find_projected_vertex_point(sketch, source, vertex_id):
+    """Return an existing live point bound to ``source``'s ``vertex_id``, or None."""
+    for (
+        curve_id,
+        bound_source,
+        bound_vid,
+        _fallback,
+        _last_co,
+    ) in iter_projected_point_bindings(sketch):
+        if bound_source == source and bound_vid == vertex_id:
+            existing = PointRef(sketch, curve_id)
+            if existing.valid:
+                return existing
+    return None
+
+
+def project_mesh_vertex(sketch, source, vertex_index, construction=True):
+    """Project a single source mesh vertex onto ``sketch`` as a live point.
+
+    Unlike :func:`project_mesh_object` (which projects a whole mesh), this is the
+    granular path used by snapping: a point snapped to one vertex gets one live
+    projected reference. Repeated snaps to the same vertex are deduplicated so
+    they share a single projected point (and thus become coincident). Returns the
+    ``PointRef`` (fixed, driven by the source vertex), or None if the index is out
+    of range.
+    """
+    if source is None or source.type != "MESH":
+        raise TypeError("Source must be a mesh object")
+    mesh = source.data
+    if not (0 <= vertex_index < len(mesh.vertices)):
+        return None
+
+    vertex_id = ensure_vertex_id(mesh, vertex_index)
+    existing = find_projected_vertex_point(sketch, source, vertex_id)
+    if existing is not None:
+        return existing
+
+    owner = sketch.target_object
+    local = owner.matrix_world.inverted() @ (
+        source.matrix_world @ mesh.vertices[vertex_index].co
+    )
+    with batch_update(sketch):
+        point = PointRef.create(
+            sketch,
+            (local.x, local.y),
+            construction=construction,
+            fixed=True,
+            name="Projected Point",
+        )
+        bind_projected_point(sketch, point, source, vertex_index)
+    return point
+
+
 def project_mesh_object(sketch, source, construction=True):
     """Project every edge of ``source`` onto ``sketch`` as live native curves.
 
