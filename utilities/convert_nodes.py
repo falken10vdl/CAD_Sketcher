@@ -1,39 +1,23 @@
 """Conversion-node helpers shared by the asset and programmatic paths.
 
-The shipped node group (``resources/assets.blend``) closes sketch loops for
-filling with Merge by Distance, which is a distance threshold and therefore
-fragile: too tight and loose junctions never weld (fill vanishes), too loose and
-distinct points on small models merge. Blender 5.2 adds the ``Merge Points`` node
-with a ``Merge ID`` input, letting us weld by *identity* instead.
-
-This builds an equivalent group that welds mesh vertices sharing a ``merge_id``
-(see ``utilities.curve_data.compute_merge_ids``), gated to true segment endpoints
-via vertex valence so tessellated interior vertices are never merged. The result
-is tolerance-free and independent of sketch scale. Older Blender keeps loading
-the merge-by-distance asset; both paths share the stable generated-id tail below.
-
-Generated vertices publish their persistent link key through Blender's reserved
-``id`` point attribute. Consumers that support persistent mesh identity should
-use that public key rather than topology-global vertex indices. Generated faces
-use ``cad_sketcher_face_id`` because Blender has no equivalent standard face-domain
-``id`` contract.
+The standard converter remains shared by sketches without user attributes.
+Attribute-bearing sketches share a schema-specific variant. Instead of trying to
+carry arbitrary fields through every topology-changing node, the variant samples
+live values from a Curve-to-Points lookup built from the filtered native source
+and writes them onto the final generated geometry. Attribute values therefore
+remain native source data and value edits never rebuild the node tree.
 """
 
 import bpy
 
 CONVERT_NODE_GROUP = "CAD Sketcher Convert"
-# Blender's reserved point-domain identity attribute. This is intentionally the
-# public vertex link key for consumers of evaluated CAD Sketcher meshes.
 VERTEX_ID_ATTR = "id"
 FACE_ID_ATTR = "cad_sketcher_face_id"
 SOURCE_CURVE_ID_ATTR = ".cad_sketcher_source_curve_id"
 SOURCE_ENDPOINT_ID_ATTR = ".cad_sketcher_source_endpoint_id"
 
 GENERATED_ID_VERSION = 2
-
-# Bump whenever the built node tree changes, so groups baked into existing files
-# (or a stale merge-by-distance asset of the same name) are rebuilt on load.
-CONVERT_VERSION = 5
+CONVERT_VERSION = 12
 
 _CHILD_ID_MULTIPLIER = 1_000_003
 _VERTEX_ROLE = 0x13579
@@ -41,12 +25,9 @@ _FACE_ROLE = 0x2468B
 
 
 def _int_compare(nodes, links, operation, value):
-    """A Compare node on integers: returns (node, a_socket) with B set to value."""
     cmp = nodes.new("FunctionNodeCompare")
     cmp.data_type = "INT"
     cmp.operation = operation
-    # data_type='INT' exposes just the two integer sockets; pick them by type so
-    # this doesn't depend on socket ordering across Blender versions.
     a, b = (s for s in cmp.inputs if s.enabled and s.type == "INT")
     b.default_value = value
     return cmp, a
@@ -54,6 +35,73 @@ def _int_compare(nodes, links, operation, value):
 
 def _is_identity_group(ng) -> bool:
     return any(n.bl_idname == "GeometryNodeMergePoints" for n in ng.nodes)
+
+
+def normalize_attribute_definitions(attribute_definitions):
+    """Return stable non-object specs used by the conversion group."""
+    specs = []
+    for entry in attribute_definitions or ():
+        name = str(entry.get("name", "")).strip()
+        data_type = str(entry.get("type", "")).upper()
+        domain = str(entry.get("domain", "")).upper()
+        if not name or domain == "OBJECT":
+            continue
+        if data_type not in {"BOOLEAN", "INT", "FLOAT"}:
+            continue
+        if domain not in {"POINT", "CURVE"}:
+            continue
+        specs.append({"name": name, "type": data_type, "domain": domain})
+    specs.sort(key=lambda item: (item["name"], item["domain"], item["type"]))
+    return specs
+
+
+def attribute_signature(specs):
+    return repr(tuple((x["name"], x["type"], x["domain"]) for x in specs))
+
+
+def _transfer_custom_attributes(nodes, links, source_curves, geometry, specs):
+    """Sample live source values onto final generated points.
+
+    Curve to Points preserves both native POINT attributes and adapts CURVE-domain
+    attributes to its point cloud. Sample Nearest maps every generated point to a
+    lookup point, and Sample Index reads the requested value in that lookup's
+    POINT domain. This makes the transfer independent of attribute propagation in
+    Curve to Mesh, Merge Points, Mesh to Curve, and Fill Curve.
+    """
+    if not specs:
+        return geometry
+
+    lookup = nodes.new("GeometryNodeCurveToPoints")
+    lookup.mode = "EVALUATED"
+    links.new(source_curves, lookup.inputs["Curve"])
+    lookup_points = lookup.outputs["Points"]
+
+    current = geometry
+    for entry in specs:
+        nearest = nodes.new("GeometryNodeSampleNearest")
+        nearest.domain = "POINT"
+        links.new(lookup_points, nearest.inputs["Geometry"])
+
+        named = nodes.new("GeometryNodeInputNamedAttribute")
+        named.data_type = entry["type"]
+        named.inputs["Name"].default_value = entry["name"]
+
+        sample = nodes.new("GeometryNodeSampleIndex")
+        sample.data_type = entry["type"]
+        sample.domain = "POINT"
+        sample.clamp = True
+        links.new(lookup_points, sample.inputs["Geometry"])
+        links.new(named.outputs["Attribute"], sample.inputs["Value"])
+        links.new(nearest.outputs["Index"], sample.inputs["Index"])
+
+        store = nodes.new("GeometryNodeStoreNamedAttribute")
+        store.data_type = entry["type"]
+        store.domain = "POINT"
+        store.inputs["Name"].default_value = entry["name"]
+        links.new(current, store.inputs["Geometry"])
+        links.new(sample.outputs["Value"], store.inputs["Value"])
+        current = store.outputs["Geometry"]
+    return current
 
 
 def _named_int(nodes, name):
@@ -64,7 +112,6 @@ def _named_int(nodes, name):
 
 
 def _local_child_index(nodes, links, source, domain):
-    """Return a zero-based index accumulated independently per stable source."""
     accumulate = nodes.new("GeometryNodeAccumulateField")
     accumulate.data_type = "INT"
     accumulate.domain = domain
@@ -98,16 +145,7 @@ def _store_int_attribute(nodes, links, geometry, value, name, domain):
 
 
 def add_generated_id_nodes(nodes, links, geometry):
-    """Append stable generated vertex/face ids and return the new geometry.
-
-    Source ids are hashes of the native Curves UUID attributes. Accumulate Field
-    supplies an index local to each source rather than the topology-global Index,
-    so inserting another curve cannot renumber unaffected children.
-
-    Vertex identity is written to Blender's reserved ``id`` point attribute so it
-    remains the public persistent link key on evaluated meshes. Face identity is
-    stored separately because there is no standard face-domain ``id`` attribute.
-    """
+    """Append stable generated vertex/face ids and return the new geometry."""
     curve_source = _named_int(nodes, SOURCE_CURVE_ID_ATTR)
     endpoint_source = _named_int(nodes, SOURCE_ENDPOINT_ID_ATTR)
 
@@ -131,8 +169,6 @@ def add_generated_id_nodes(nodes, links, geometry):
         "POINT",
     )
 
-    # Adapt the stable boundary ids to each fill child, then distinguish any
-    # siblings with an index accumulated only within that stable source group.
     face_source = _named_int(nodes, VERTEX_ID_ATTR)
     face_local = _local_child_index(nodes, links, face_source, "FACE")
     face_id = _child_id(nodes, links, face_source, face_local, _FACE_ROLE)
@@ -163,16 +199,19 @@ def ensure_generated_id_nodes(node_group):
     return node_group
 
 
-def build_convert_node_group(name: str = CONVERT_NODE_GROUP):
-    """Build the identity-weld convert node group (idempotent).
+def build_convert_node_group(
+    name: str = CONVERT_NODE_GROUP, attribute_definitions=None
+):
+    """Build the identity-weld converter, sharing attribute variants by schema."""
+    specs = normalize_attribute_definitions(attribute_definitions)
+    signature = attribute_signature(specs)
 
-    Reuses an existing group of the same name, rebuilding it in place if it's a
-    stale (merge-by-distance) version — so modifiers already bound to that name
-    upgrade without rebinding.
-    """
     ng = bpy.data.node_groups.get(name)
     if ng is not None:
-        if ng.get("cad_convert_version") == CONVERT_VERSION:
+        if (
+            ng.get("cad_convert_version") == CONVERT_VERSION
+            and ng.get("cad_convert_attribute_signature", "") == signature
+        ):
             return ng
         ng.nodes.clear()
         ng.links.clear()
@@ -190,8 +229,6 @@ def build_convert_node_group(name: str = CONVERT_NODE_GROUP):
     gi = nodes.new("NodeGroupInput")
     go = nodes.new("NodeGroupOutput")
 
-    # 1. Drop construction curves and degenerate (< 2 point) splines before the
-    #    fill so they never become geometry.
     construction = nodes.new("GeometryNodeInputNamedAttribute")
     construction.data_type = "BOOLEAN"
     construction.inputs["Name"].default_value = "construction"
@@ -209,14 +246,11 @@ def build_convert_node_group(name: str = CONVERT_NODE_GROUP):
     delete.domain = "CURVE"
     links.new(gi.outputs["Geometry"], delete.inputs["Geometry"])
     links.new(drop.outputs["Boolean"], delete.inputs["Selection"])
+    filtered_source = delete.outputs["Geometry"]
 
-    # 2. Tessellate to a wire mesh.
     to_mesh = nodes.new("GeometryNodeCurveToMesh")
-    links.new(delete.outputs["Geometry"], to_mesh.inputs["Curve"])
+    links.new(filtered_source, to_mesh.inputs["Curve"])
 
-    # 3. Weld by identity: merge vertices sharing merge_id, but only true segment
-    #    endpoints (valence 1 on the disconnected chains) -- tessellated interior
-    #    vertices (valence 2) are excluded, so their interpolated id is harmless.
     merge_id = nodes.new("GeometryNodeInputNamedAttribute")
     merge_id.data_type = "INT"
     merge_id.inputs["Name"].default_value = "merge_id"
@@ -225,8 +259,6 @@ def build_convert_node_group(name: str = CONVERT_NODE_GROUP):
     is_end, end_a = _int_compare(nodes, links, "EQUAL", 1)
     links.new(neighbors.outputs["Vertex Count"], end_a)
 
-    # id 0 means "no weld". Exclude it so a not-yet-computed merge_id (e.g. a
-    # transient frame mid-draw) can't collapse every endpoint into one point.
     nonzero, nz_a = _int_compare(nodes, links, "NOT_EQUAL", 0)
     links.new(merge_id.outputs["Attribute"], nz_a)
     weld = nodes.new("FunctionNodeBooleanMath")
@@ -239,7 +271,6 @@ def build_convert_node_group(name: str = CONVERT_NODE_GROUP):
     links.new(merge_id.outputs["Attribute"], merge.inputs["Merge ID"])
     links.new(weld.outputs["Boolean"], merge.inputs["Selection"])
 
-    # 4. Back to curves; fill closed loops, or output the wire when Fill is off.
     to_curve = nodes.new("GeometryNodeMeshToCurve")
     links.new(merge.outputs["Geometry"], to_curve.inputs["Mesh"])
 
@@ -252,11 +283,13 @@ def build_convert_node_group(name: str = CONVERT_NODE_GROUP):
     links.new(to_curve.outputs["Curve"], switch.inputs["False"])
     links.new(fill_curve.outputs["Mesh"], switch.inputs["True"])
 
-    # 5. Derive generated-element identity from persistent source UUIDs and
-    #    source-local child indices (never from topology-global Index).
     geometry = add_generated_id_nodes(nodes, links, switch.outputs["Output"])
+    geometry = _transfer_custom_attributes(
+        nodes, links, filtered_source, geometry, specs
+    )
     links.new(geometry, go.inputs["Geometry"])
 
     ng["cad_convert_version"] = CONVERT_VERSION
     ng["cad_generated_id_version"] = GENERATED_ID_VERSION
+    ng["cad_convert_attribute_signature"] = signature
     return ng
