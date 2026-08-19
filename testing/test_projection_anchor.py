@@ -8,6 +8,7 @@ from ..utilities.projection_anchor import (
     PROJECT_VERTEX_INDEX_ATTR,
     VERTEX_ID_ATTR,
     project_mesh_object,
+    project_mesh_vertex,
     refresh_projection_for_sketch,
 )
 from .utils import Sketch2dTestCase
@@ -104,3 +105,33 @@ class TestProjectionAnchor(Sketch2dTestCase):
         )
 
         self.assertLess((points[1].co - Vector((3.5, 2.5))).length, 1e-5)
+
+    def test_project_single_vertex_dedup_and_live(self):
+        # The granular snap path: one vertex -> one live point, reused on repeat.
+        source = self._mesh_object()
+
+        point = project_mesh_vertex(self.sketch, source, 1, construction=True)
+        self.assertIsNotNone(point)
+        self.assertTrue(point.fixed)
+        self.assertTrue(point.construction)
+        self.assertLess((point.co - Vector((2.0, 0.0))).length, 1e-6)
+
+        # Snapping the same vertex again must reuse the existing point, not stack
+        # a second projected reference on top of it.
+        again = project_mesh_vertex(self.sketch, source, 1, construction=True)
+        self.assertEqual(again.curve_id, point.curve_id)
+
+        # A different vertex gets its own point.
+        other = project_mesh_vertex(self.sketch, source, 0, construction=True)
+        self.assertNotEqual(other.curve_id, point.curve_id)
+
+        # Out-of-range index is a no-op rather than a crash.
+        self.assertIsNone(project_mesh_vertex(self.sketch, source, 99))
+
+        # The live link tracks source edits, same as a full projection.
+        source.data.vertices[1].co = (4.0, 1.0, 1.0)
+        source.data.update()
+        self.context.view_layer.update()
+        depsgraph = self.context.evaluated_depsgraph_get()
+        refresh_projection_for_sketch(self.sketch, depsgraph, force=True)
+        self.assertLess((point.co - Vector((4.0, 1.0))).length, 1e-5)
