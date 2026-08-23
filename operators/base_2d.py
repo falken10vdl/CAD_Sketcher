@@ -88,6 +88,7 @@ class Operator2d(GenericEntityOp):
 
     def init(self, context: Context, event: Event):
         from ..model.sketch_ref import get_active_sketch
+
         self._active_sketch = get_active_sketch(context)
         return True
 
@@ -97,6 +98,7 @@ class Operator2d(GenericEntityOp):
             import bpy
 
             from ..model.sketch_ref import get_active_sketch
+
             self._active_sketch = get_active_sketch(bpy.context)
         return self._active_sketch
 
@@ -119,6 +121,9 @@ class Operator2d(GenericEntityOp):
         # deferred creation can anchor it (fixed) — otherwise an inferred
         # constraint would drag the snapped point off target (see create_element).
         self.state_data["snapped"] = self._snap is not None
+        # Stash the snap target so create_element can live-project it (the marker
+        # reflects the current position; at click this is the committed one).
+        self.state_data["snap"] = self._snap
 
         # Handle implicit properties based on state.types
         if SlvsPoint2D in state.types:
@@ -146,14 +151,120 @@ class Operator2d(GenericEntityOp):
 
         return super().state_func(context, coords)
 
+    def _maybe_link_projected_snap(self, context: Context, state_data):
+        """Live-project a snapped mesh feature and register it for coincidence.
+
+        When a point is snapped onto external mesh geometry, create (or reuse) a
+        live projected reference and set it as the coincidence target, so the
+        placed point tracks the source instead of being a dead static point.
+        Handles vertex snaps (bind the vertex) and edge-midpoint snaps (bind the
+        edge's two endpoints, ride at their midpoint). Other snap types, and cases
+        where the snapped feature can't be traced to an original one, fall back to
+        the static point.
+        """
+        if not context.scene.sketcher.use_snap_project:
+            return
+        if not self.use_auto_constraints(context, state_data):
+            return
+        if state_data.get("hovered"):
+            return  # already coinciding with an existing sketch entity
+
+        snap = state_data.get("snap")
+        if not snap:
+            return
+        snap_type = snap.get("type")
+        if snap_type not in ("VERTEX", "EDGE_MIDPOINT", "EDGE"):
+            return
+        source = bpy.data.objects.get(snap.get("object") or "")
+        if source is None or source.type != "MESH":
+            return
+
+        # Snapping reads the evaluated mesh; resolve the evaluated vertices back to
+        # the original ones to bind (by persistent id when tagged, else an
+        # order-preserving index). Skip when the correspondence isn't trustworthy.
+        from ..stateful_operator.utilities.geometry import get_evaluated_obj
+        from ..utilities.projection_anchor import (
+            project_mesh_edge,
+            project_mesh_edge_midpoint,
+            project_mesh_vertex,
+            resolve_source_vertex_index,
+        )
+
+        eval_source = get_evaluated_obj(context, source)
+        world_point = snap.get("world_point")
+
+        # Place the point where the user snapped (the evaluated hit), so a
+        # vertex-moving modifier doesn't leave it a frame behind the source.
+        if snap_type == "VERTEX":
+            v_index = snap.get("vertex_index")
+            if v_index is None:
+                return
+            orig = resolve_source_vertex_index(source, eval_source, v_index)
+            if orig is None:
+                return
+            projected = project_mesh_vertex(
+                self.sketch, source, orig, construction=True, world_co=world_point
+            )
+        else:  # EDGE_MIDPOINT or EDGE: both bind the edge's two endpoints
+            edge = snap.get("edge_vertices")
+            if not edge:
+                return
+            orig_a = resolve_source_vertex_index(source, eval_source, edge[0])
+            orig_b = resolve_source_vertex_index(source, eval_source, edge[1])
+            if orig_a is None or orig_b is None:
+                return
+            if snap_type == "EDGE_MIDPOINT":
+                projected = project_mesh_edge_midpoint(
+                    self.sketch,
+                    source,
+                    orig_a,
+                    orig_b,
+                    construction=True,
+                    world_co=world_point,
+                )
+            else:
+                # Project the edge as a live line; the placed point coincides onto
+                # it (point-on-line), so it slides along the edge rather than being
+                # pinned. SlvsCoincident accepts (POINT, LINE), so setting the line
+                # as the hovered target below yields the right constraint.
+                projected = project_mesh_edge(
+                    self.sketch, source, orig_a, orig_b, construction=True
+                )
+
+        if projected is not None and projected.valid:
+            state_data["hovered"] = projected.curve_id
+            # A vertex/midpoint projection pins the endpoint to a FIXED point, so
+            # it can't move; an auto axis-alignment on such an endpoint would fight
+            # the fixed position (inconsistent when the features aren't exactly
+            # aligned). Flag it so the line tool skips alignment, same as it does
+            # for two statically-fixed endpoints. An edge projection is point-on-
+            # line (the endpoint can still slide), so it is not flagged.
+            if snap_type in ("VERTEX", "EDGE_MIDPOINT"):
+                state_data["snap_anchored"] = True
+
+    def point_is_anchored(self, index: int) -> bool:
+        """Whether the point placed for state ``index`` is pinned in place.
+
+        True when the endpoint is a live-projected vertex/midpoint (coincident to a
+        FIXED projected point) -- an auto axis-alignment on it would fight the fixed
+        position. Used by tools that add alignment constraints to skip it.
+        """
+        return bool(self._state_data.get(index, {}).get("snap_anchored", False))
+
     # create element depending on mode
     def create_element(self, context: Context, values: List[Any], state, state_data):
         sketch = self.sketch
         loc = values[0]
 
+        # Snapped onto external mesh geometry: live-project it and coincide, so
+        # the point tracks the source. Registers the projected point as the
+        # coincidence target below (behaves like snapping onto a sketch entity).
+        self._maybe_link_projected_snap(context, state_data)
+
         # A point snapped to external geometry is a deliberate placement: fix it
-        # so the solver keeps it there. Points snapped onto a sketch entity are
-        # pinned by the coincident constraint below instead, so skip those.
+        # so the solver keeps it there. Points snapped onto a sketch entity (or a
+        # live-projected reference above) are pinned by the coincident constraint
+        # below instead, so skip those.
         fixed = state_data.get("snapped", False) and not state_data.get("hovered")
 
         ref = PointRef.create(sketch, loc, fixed=fixed)
@@ -169,6 +280,7 @@ class Operator2d(GenericEntityOp):
     def _check_constrain(self, context: Context, curve_id: int):
         """Check if a hovered curve_id is a constrainable type (line/arc/circle)."""
         from ..model.curve_ref import ArcRef, CircleRef, LineRef
+
         sketch = self.sketch
         if not sketch:
             return False
@@ -195,5 +307,3 @@ class Operator2d(GenericEntityOp):
         if cid:
             return PointRef(sketch, cid)
         return getattr(self, state.pointer)
-
-
