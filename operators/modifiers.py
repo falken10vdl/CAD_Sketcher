@@ -327,7 +327,15 @@ class NodeOperator(Operator3d):
     # instance, losing the transient pointer state) can re-resolve the object
     # and edit the existing modifier instead of failing. Not SKIP_SAVE: it must
     # survive redo; main() overwrites it every run so a stale value is harmless.
-    target_name: StringProperty(options={"HIDDEN"})
+    # Editable: the redo panel exposes it as an object picker (see draw_settings),
+    # so a finished op can be retargeted to a different object.
+    target_name: StringProperty(name="Target", options={"HIDDEN"})
+
+    # Where this op's modifier was last applied (object + modifier name). Persisted
+    # across redo so retargeting via the panel can drop the now-orphaned modifier
+    # from the previous object/name instead of leaving it behind. Not SKIP_SAVE.
+    applied_object: StringProperty(options={"HIDDEN"})
+    applied_modifier: StringProperty(options={"HIDDEN"})
 
     @classmethod
     def poll(cls, context):
@@ -440,6 +448,31 @@ class NodeOperator(Operator3d):
         self.modifier.node_group = nodegroup
         return True
 
+    def _relocate_stale_modifier(self, ob):
+        """Drop the modifier this op applied on a previous run when it no longer
+        belongs there -- the redo panel retargeted to a different object, or (for
+        per-cutter names like Boolean) the modifier name changed. Without this a
+        retarget would leave the old modifier orphaned on the old object.
+
+        The rim edges / vertices are untouched; only the stale modifier is
+        removed. No-op on the interactive path (target unchanged run to run) and
+        on the first run (nothing applied yet).
+        """
+        if not self.applied_object:
+            return
+        if (
+            self.applied_object == ob.name
+            and self.applied_modifier == self._modifier_name()
+        ):
+            return
+        prev = bpy.data.objects.get(self.applied_object)
+        if prev is None:
+            return
+        old = prev.modifiers.get(self.applied_modifier)
+        if old is not None:
+            prev.modifiers.remove(old)
+            prev.update_tag()
+
     def main(self, context):
         ob = self.resolved_object()
         if not self.is_valid_target(ob):
@@ -452,15 +485,29 @@ class NodeOperator(Operator3d):
         self.target_name = ob.name
         self._obj = ob
 
+        # Retargeted via the redo panel: remove the modifier from wherever it was.
+        self._relocate_stale_modifier(ob)
+
         if not self._ensure_modifier(context):
             return False
 
         retval = self.set_props()
+        # Record where the modifier now lives so a later retarget can relocate it.
+        self.applied_object = ob.name
+        self.applied_modifier = self._modifier_name()
         ob.original.update_tag()
         return retval
 
     def set_props(self):
         pass
+
+    def draw_settings(self, context):
+        """Redo-panel settings. The base draws the target object picker so a
+        finished op can be retargeted; subclasses add their own rows and should
+        call ``super().draw_settings(context)`` to keep it."""
+        self.layout.prop_search(
+            self, "target_name", bpy.data, "objects", text="Target"
+        )
 
 
 class View3D_OT_node_fill(Operator, NodeOperator):
@@ -542,6 +589,7 @@ class View3D_OT_node_extrude(Operator, BooleanFromToolMixin, NodeOperator):
         return True
 
     def draw_settings(self, context):
+        super().draw_settings(context)
         layout = self.layout
         layout.prop(self, "mirror")
         layout.prop(self, "asymmetry")
@@ -650,6 +698,7 @@ class View3D_OT_node_array_linear(Operator, NodeOperator):
         return True
 
     def draw_settings(self, context):
+        super().draw_settings(context)
         layout = self.layout
 
         layout.prop(self, "offset")
@@ -846,6 +895,7 @@ class View3D_OT_node_revolve(Operator, BooleanFromToolMixin, NodeOperator):
         return True
 
     def draw_settings(self, context):
+        super().draw_settings(context)
         layout = self.layout
         row = layout.row(align=True)
         row.prop(self, "angle")
@@ -1026,6 +1076,7 @@ class View3D_OT_node_boolean(Operator, NodeOperator):
         return True
 
     def draw_settings(self, context):
+        super().draw_settings(context)  # the body (target) picker
         layout = self.layout
         layout.prop_search(self, "cutter_name", bpy.data, "objects", text="Cutter")
         layout.prop(self, "operation")

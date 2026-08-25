@@ -281,6 +281,73 @@ class TestNodeTools(BgsTestCase):
         n = len([m for m in ob.modifiers if m.name == "CAD_Sketcher Revolve"])
         self.assertEqual(n, 1)
 
+    def test_retarget_moves_modifier_to_the_new_object(self):
+        # Editing the object in the redo panel -- a re-exec with a new target_name
+        # plus the persisted applied_object/applied_modifier -- must MOVE this op's
+        # modifier to the new object, not orphan it on the old one.
+        import math
+
+        a, b = self._cube(), self._cube()
+        a.name, b.name = "TargetA", "TargetB"
+        common = dict(
+            axis_origin=(0.0, 0.0, 0.0),
+            axis_direction=(0.0, 0.0, 1.0),
+            angle=math.pi,
+            angular_resolution=math.radians(30),
+            flip=False,
+        )
+        r1 = bpy.ops.view3d.slvs_node_revolve(
+            "EXEC_DEFAULT", target_name="TargetA", **common
+        )
+        self.assertEqual(r1, {"FINISHED"})
+        self.assertIsNotNone(a.modifiers.get("CAD_Sketcher Revolve"))
+
+        r2 = bpy.ops.view3d.slvs_node_revolve(
+            "EXEC_DEFAULT",
+            target_name="TargetB",
+            applied_object="TargetA",
+            applied_modifier="CAD_Sketcher Revolve",
+            **common,
+        )
+        self.assertEqual(r2, {"FINISHED"})
+        self.assertIsNone(
+            a.modifiers.get("CAD_Sketcher Revolve"),
+            "old target kept its modifier after retarget",
+        )
+        self.assertIsNotNone(
+            b.modifiers.get("CAD_Sketcher Revolve"),
+            "new target did not receive the modifier",
+        )
+
+    def test_boolean_retarget_cutter_removes_old_modifier(self):
+        # A boolean modifier is named per cutter, so retargeting the cutter in the
+        # redo panel changes the name; the old-named modifier must be removed, not
+        # left beside the new one (which would double-cut / orphan).
+        body, c, d = self._cube(), self._cube(), self._cube()
+        body.name, c.name, d.name = "Body", "CutC", "CutD"
+
+        r1 = bpy.ops.view3d.slvs_node_boolean(
+            "EXEC_DEFAULT", target_name="Body", cutter_name="CutC"
+        )
+        self.assertEqual(r1, {"FINISHED"})
+        self.assertIsNotNone(body.modifiers.get("CAD_Sketcher Boolean CutC"))
+
+        r2 = bpy.ops.view3d.slvs_node_boolean(
+            "EXEC_DEFAULT",
+            target_name="Body",
+            cutter_name="CutD",
+            applied_object="Body",
+            applied_modifier="CAD_Sketcher Boolean CutC",
+        )
+        self.assertEqual(r2, {"FINISHED"})
+        names = [
+            m.name for m in body.modifiers
+            if m.name.startswith("CAD_Sketcher Boolean")
+        ]
+        self.assertEqual(
+            names, ["CAD_Sketcher Boolean CutD"], f"expected only CutD, got {names}"
+        )
+
     def test_revolve_readback_seeds_props_from_modifier(self):
         # Re-invoking on an object that already has the modifier should start
         # from its current values, not the defaults. read_props pulls the angle
