@@ -1,25 +1,24 @@
 import logging
 
-from bpy.types import Operator, Context
 from bpy.props import FloatProperty
+from bpy.types import Context, Operator
 
 from ..curve_solver import solve_system
 from ..declarations import Operators
-from ..stateful_operator.utilities.register import register_stateops_factory
-from .base_constraint import GenericConstraintOp
-from ..utilities.select import deselect_all
-from ..utilities.view import refresh
 from ..drawing import selection
-
 from ..model.coincident import SlvsCoincident
 from ..model.equal import SlvsEqual
-from ..model.vertical import SlvsVertical
 from ..model.horizontal import SlvsHorizontal
+from ..model.midpoint import SlvsMidpoint
 from ..model.parallel import SlvsParallel
 from ..model.perpendicular import SlvsPerpendicular
-from ..model.tangent import SlvsTangent
-from ..model.midpoint import SlvsMidpoint
 from ..model.ratio import SlvsRatio
+from ..model.tangent import SlvsTangent
+from ..model.vertical import SlvsVertical
+from ..stateful_operator.utilities.register import register_stateops_factory
+from ..utilities.select import deselect_all
+from ..utilities.view import refresh
+from .base_constraint import GenericConstraintOp
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +50,27 @@ def merge_points(context, duplicate, target):
         if getattr(c, "curve_id_3", 0) == dup_cid:
             c.curve_id_3 = tgt_cid
 
+    # A constraint that referenced both merged points (e.g. a coincident joining
+    # the two) is now self-referential after the remap. Leaving it behind yields a
+    # redundant/failed constraint, so drop any that collapsed onto a single curve.
+    _remove_self_referential(sketch.constraints)
+
     # Remove duplicate
     duplicate.remove()
+
+
+def _remove_self_referential(constraints):
+    """Remove constraints whose two curve references collapsed to the same curve."""
+    while True:
+        degenerate = None
+        for c in constraints.all:
+            id1 = getattr(c, "curve_id_1", "")
+            if id1 and id1 == getattr(c, "curve_id_2", ""):
+                degenerate = c
+                break
+        if degenerate is None:
+            return
+        constraints.remove(degenerate)
 
 
 class VIEW3D_OT_slvs_merge_points(Operator):
@@ -68,8 +86,8 @@ class VIEW3D_OT_slvs_merge_points(Operator):
         return bool(get_active_sketch(context))
 
     def execute(self, context: Context):
-        from ..model.sketch_ref import get_active_sketch
         from ..model.curve_ref import curve_ref
+        from ..model.sketch_ref import get_active_sketch
 
         sketch = get_active_sketch(context)
         if not sketch:
