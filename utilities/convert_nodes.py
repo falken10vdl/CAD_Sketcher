@@ -246,6 +246,15 @@ def build_convert_node_group(name: str = CONVERT_NODE_GROUP):
     links.new(merge.outputs["Geometry"], to_curve.inputs["Mesh"])
 
     fill_curve = nodes.new("GeometryNodeFillCurve")
+    # Fill with n-gons, not the default triangle fan: the filled sketch should
+    # carry only its outline plus a single face per region, with no interior
+    # triangulation edges. A region with a hole can't be one mesh face, so it
+    # splits into the fewest n-gons rather than triangulating. Blender 5.x
+    # exposes the mode as a "Mode" input socket (older trees, as a property).
+    if "Mode" in fill_curve.inputs:
+        fill_curve.inputs["Mode"].default_value = "N-gons"
+    else:  # pragma: no cover - pre-5.x fallback
+        fill_curve.mode = "NGONS"
     links.new(to_curve.outputs["Curve"], fill_curve.inputs["Curve"])
 
     switch = nodes.new("GeometryNodeSwitch")
