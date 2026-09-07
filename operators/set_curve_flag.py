@@ -1,10 +1,10 @@
-from bpy.types import Operator, Context, Event
-from bpy.props import StringProperty, BoolProperty
+from bpy.props import BoolProperty, FloatVectorProperty, StringProperty
+from bpy.types import Context, Event, Operator
 from bpy.utils import register_classes_factory
 
 from ..declarations import Operators
-from ..model.curve_ref import curve_ref
 from ..drawing import selection
+from ..model.curve_ref import curve_ref
 
 
 class View3D_OT_slvs_set_curve_flag(Operator):
@@ -20,6 +20,7 @@ class View3D_OT_slvs_set_curve_flag(Operator):
 
     def execute(self, context: Context):
         from ..model.sketch_ref import get_active_sketch
+
         sketch = get_active_sketch(context)
         if not sketch:
             return {"CANCELLED"}
@@ -72,6 +73,122 @@ class View3D_OT_slvs_rename_curve(Operator):
         return {"FINISHED"}
 
 
+def _solve_and_refresh(context: Context, sketch) -> None:
+    """Re-solve the sketch and rebuild its display geometry after an edit."""
+    from ..curve_solver import solve_system
+    from ..utilities.curve_data import refresh_curve_geometry
+
+    sketch.geometry_solved = False
+    solve_system(context, sketch=sketch)
+    refresh_curve_geometry(sketch)
+    if context.area:
+        context.area.tag_redraw()
+
+
+class View3D_OT_slvs_set_point_coords(Operator):
+    """Edit this point's coordinates"""
+
+    bl_idname = Operators.SetPointCoords
+    bl_label = "Set Coordinates"
+    # REGISTER so the Adjust Last Operation panel can also tweak the coordinates.
+    bl_options = {"REGISTER", "UNDO"}
+
+    curve_id: StringProperty()
+    # A single vector drawn as one multi-field widget: all components commit
+    # together, unlike separate per-row fields where only the first committed.
+    coords: FloatVectorProperty(name="Coordinates", size=3, subtype="XYZ")
+
+    def invoke(self, context: Context, event: Event):
+        from ..model.sketch_ref import get_active_sketch
+
+        sketch = get_active_sketch(context)
+        if not sketch:
+            return {"CANCELLED"}
+        ref = curve_ref(sketch, self.curve_id)
+        if not ref.valid or not ref.is_point():
+            return {"CANCELLED"}
+
+        self.coords = ref._first_point_3d()
+        # props_popup (not props_dialog): it executes live on each field change,
+        # so the point tracks every edit. A dialog only commits on OK and can
+        # drop the value of the field still being edited when OK is pressed.
+        return context.window_manager.invoke_props_popup(self, event)
+
+    def draw(self, context: Context):
+        # Draw the whole vector in a single prop() call so all components commit
+        # together. Splitting it into per-component prop() calls (separate
+        # widgets) left every field but the first uncommitted. On a planar (2D)
+        # sketch Z is shown but ignored on write; the point stays on the plane.
+        col = self.layout.column()
+        col.prop(self, "coords", text="")
+
+    def execute(self, context: Context):
+        from ..model.native_3d import rebuild_3d_lines
+        from ..model.sketch_ref import get_active_sketch
+
+        sketch = get_active_sketch(context)
+        if not sketch:
+            return {"CANCELLED"}
+        ref = curve_ref(sketch, self.curve_id)
+        if not ref.valid or not ref.is_point():
+            return {"CANCELLED"}
+
+        if sketch.is_3d:
+            # 3D points carry a real local Z, so write the position directly
+            # (the 2D co setter would flatten it) and rebuild the wire display.
+            if not ref._resolve():
+                return {"CANCELLED"}
+            curve_data = sketch.target_object.data
+            pt_idx = ref._curve_slice.points[0].index
+            curve_data.points[pt_idx].position = tuple(self.coords)
+            rebuild_3d_lines(sketch)
+            curve_data.update_tag()
+        else:
+            ref.co = (self.coords[0], self.coords[1])
+
+        _solve_and_refresh(context, sketch)
+        return {"FINISHED"}
+
+
+class View3D_OT_slvs_flip_arc(Operator):
+    """Connect the arc's endpoints in the inverted order"""
+
+    bl_idname = Operators.FlipArc
+    bl_label = "Invert Direction"
+    bl_options = {"UNDO"}
+
+    curve_id: StringProperty()
+
+    def execute(self, context: Context):
+        from ..model.sketch_ref import get_active_sketch
+        from ..utilities.curve_data import rebuild_segments
+
+        sketch = get_active_sketch(context)
+        if not sketch:
+            return {"CANCELLED"}
+        ref = curve_ref(sketch, self.curve_id)
+        if not ref.valid or not ref.is_arc():
+            return {"CANCELLED"}
+
+        # Arc geometry always sweeps CCW from start to end, so swapping the
+        # endpoint references yields the complementary arc between the same
+        # points. rebuild_segments re-bakes it (adapting the control-point count
+        # to the new sweep angle).
+        start = ref._get_attr_value("start_point_id", "")
+        end = ref._get_attr_value("end_point_id", "")
+        ref._set_attr_value("start_point_id", end)
+        ref._set_attr_value("end_point_id", start)
+        rebuild_segments(sketch)
+
+        _solve_and_refresh(context, sketch)
+        return {"FINISHED"}
+
+
 register, unregister = register_classes_factory(
-    (View3D_OT_slvs_set_curve_flag, View3D_OT_slvs_rename_curve)
+    (
+        View3D_OT_slvs_set_curve_flag,
+        View3D_OT_slvs_rename_curve,
+        View3D_OT_slvs_set_point_coords,
+        View3D_OT_slvs_flip_arc,
+    )
 )

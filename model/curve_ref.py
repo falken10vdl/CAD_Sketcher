@@ -205,6 +205,9 @@ class CurveRef:
         layout.label(text=str(self))
         layout.separator()
 
+        # Type-specific settings (coordinates, direction, ...) go above the flags.
+        self.draw_settings(layout)
+
         col = layout.column()
         for flag in ("construction", "fixed", "visible"):
             val = getattr(self, flag)
@@ -216,6 +219,10 @@ class CurveRef:
             op.curve_id = self._curve_id
             op.flag = flag
             op.value = not val
+
+    def draw_settings(self, layout):
+        """Draw type-specific settings; overridden by typed subclasses."""
+        return
 
     # -- Deletion --
 
@@ -404,6 +411,21 @@ class PointRef(CurveRef):
 
     def is_point(self):
         return True
+
+    def draw_settings(self, layout):
+        """Show an editable-coordinates entry point."""
+        from ..declarations import Operators
+
+        # The context menu is a popup_menu, whose buttons default to EXEC; force
+        # INVOKE so the operator's coordinate dialog opens instead of running
+        # execute with unset (zeroed) coordinates.
+        sub = layout.column()
+        sub.operator_context = "INVOKE_DEFAULT"
+        op = sub.operator(
+            Operators.SetPointCoords, text="Set Coordinates", icon="TRANSFORM_ORIGINS"
+        )
+        op.curve_id = self._curve_id
+        layout.separator()
 
     @property
     def co(self):
@@ -628,6 +650,16 @@ class ArcRef(CurveRef):
 
     def is_arc(self):
         return True
+
+    def draw_settings(self, layout):
+        """Offer flipping the arc's sweep direction."""
+        from ..declarations import Operators
+
+        op = layout.operator(
+            Operators.FlipArc, text="Invert Direction", icon="ARROW_LEFTRIGHT"
+        )
+        op.curve_id = self._curve_id
+        layout.separator()
 
     @property
     def ct(self):
