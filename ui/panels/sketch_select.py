@@ -24,24 +24,42 @@ class VIEW3D_MT_slvs_add_sketch(Menu):
         )
 
 
-def _draw_detached_warning(layout: UILayout, sketch):
-    """Warn when the sketch's workplane lost its anchoring mesh face."""
-    from ...utilities.face_anchor import KEY_DETACHED
+def _draw_workplane(context: Context, layout: UILayout, sketch):
+    """Let the user move the sketch to another workplane, and show its anchor.
 
-    wp = sketch.workplane_object
-    if not wp or not wp.get(KEY_DETACHED):
+    An anchored workplane is moved back onto its face whenever the mesh updates,
+    so a manual move silently reverts. Surfacing the anchor (not only once it
+    breaks) lets the user see why and free the workplane. The anchor belongs to
+    the workplane, so say so when other sketches share it.
+    """
+    from ...utilities.face_anchor import KEY_DETACHED, KEY_FACE_ID, KEY_SOURCE
+
+    if sketch.is_3d:
         return
+    wp = sketch.workplane_object
+    ops = declarations.Operators
+    anchored = wp is not None and KEY_FACE_ID in wp
 
-    box = layout.box()
-    box.alert = True
-    box.label(text="Workplane detached from mesh face", icon="ERROR")
-    row = box.row(align=True)
-    row.operator(
-        declarations.Operators.ReattachWorkplane, text="Re-attach", icon="EYEDROPPER"
-    ).empty_name = wp.name
-    row.operator(
-        declarations.Operators.MakeWorkplaneFree, text="Make Free", icon="UNLINKED"
-    ).empty_name = wp.name
+    container = layout
+    if anchored:
+        shared = sum(1 for s in get_sketches(context) if s.workplane_object == wp)
+        suffix = f" (shared by {shared} sketches)" if shared > 1 else ""
+        if wp.get(KEY_DETACHED):
+            container = layout.box()
+            container.alert = True
+            text, icon = "Workplane detached from mesh face", "ERROR"
+        else:
+            source = wp.get(KEY_SOURCE)
+            name = source.name if source else "mesh face"
+            text, icon = f"Workplane anchored to {name}", "SNAP_FACE"
+        container.label(text=text + suffix, icon=icon)
+
+    row = container.row(align=True)
+    row.operator(ops.ChangeSketchWorkplane, text="Change Workplane", icon="EYEDROPPER")
+    if anchored:
+        row.operator(
+            ops.MakeWorkplaneFree, text="Make Free", icon="UNLINKED"
+        ).empty_name = wp.name
 
 
 def _draw_migration_prompt(context: Context, layout: UILayout):
@@ -136,7 +154,7 @@ class VIEW3D_PT_sketcher(VIEW3D_PT_sketcher_base):
                 dof_icon = "CHECKMARK" if dof_ok else "ERROR"
                 row.label(text=dof_msg, icon=dof_icon)
 
-            _draw_detached_warning(layout, sketch)
+            _draw_workplane(context, layout, sketch)
 
             layout.separator()
 
