@@ -1,9 +1,12 @@
 """Workplane empty management."""
 
+import logging
 import math
 
 import bpy
 from mathutils import Vector
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Workplane empty IDs for picking
@@ -18,15 +21,36 @@ WP_ID_YZ = 0xF00003
 _AXIS_X = (0.80, 0.24, 0.24)
 _AXIS_Y = (0.34, 0.67, 0.20)
 _AXIS_Z = (0.22, 0.40, 0.80)
+# Pick ids for the base planes of the part in focus (see utilities.part).
+WP_ID_PART_XY = 0xF00011
+WP_ID_PART_XZ = 0xF00012
+WP_ID_PART_YZ = 0xF00013
+
+_PART_PLANE_IDS = (WP_ID_PART_XY, WP_ID_PART_XZ, WP_ID_PART_YZ)
+_PART_PLANE_AXIS_ORDER = {"XY": 0, "XZ": 1, "YZ": 2}
+
+# A part's planes are drawn much smaller than the world's, so a part sitting near
+# the origin reads as a part rather than competing with the scene datums.
+PART_PLANE_SIZE_FACTOR = 0.3
+
+# A part's base planes read as the same axes as the world's, so they are tinted
+# the same way: the part's frame is what tells them apart, not the colour.
 ORIGIN_AXIS_COLOR = {
     WP_ID_XY: _AXIS_Z,
     WP_ID_XZ: _AXIS_Y,
     WP_ID_YZ: _AXIS_X,
+    WP_ID_PART_XY: _AXIS_Z,
+    WP_ID_PART_XZ: _AXIS_Y,
+    WP_ID_PART_YZ: _AXIS_X,
 }
+
 ORIGIN_LABEL = {
     WP_ID_XY: "XY",
     WP_ID_XZ: "XZ",
     WP_ID_YZ: "YZ",
+    WP_ID_PART_XY: "XY",
+    WP_ID_PART_XZ: "XZ",
+    WP_ID_PART_YZ: "YZ",
 }
 
 # Sequential pick IDs for non-origin empties start here
@@ -80,12 +104,26 @@ def iter_wp_empties(context):
             if show_origin:
                 yield wp_obj, wp_id
 
+    # The base planes of the part in focus, in the part's own frame: sketching on
+    # a moved or rotated part otherwise only offers world-aligned planes. They
+    # have no object until one is picked.
+    if show_origin:
+        from .part import PART_PLANE_KEY, part_plane_objects
+
+        for plane in part_plane_objects(context):
+            origin_names.add(plane.name)
+            yield plane, _PART_PLANE_IDS[_PART_PLANE_AXIS_ORDER[plane[PART_PLANE_KEY]]]
+
     pick_id = _EMPTY_PICK_START
     for obj in context.scene.objects:
         # visible_get() covers the eye-icon hide and collection visibility too,
         # not just hide_viewport (the monitor icon) -- an empty hidden with the
         # eye was still getting its workplane overlay drawn.
-        if obj.type != "EMPTY" or obj.name in origin_names or not obj.visible_get():
+        # Ours are hidden on purpose (see hide_managed_workplane) but must stay
+        # pickable; an empty the user made is offered only while they can see it.
+        if obj.type != "EMPTY" or obj.name in origin_names:
+            continue
+        if not is_managed_workplane(obj) and not obj.visible_get():
             continue
         yield obj, pick_id
         pick_id += 1
@@ -118,7 +156,9 @@ def wp_plane_bounds(context, pick_id):
     Shared by drawing and hit-testing so the visible and pickable areas match.
     """
     h = wp_display_half_size(context)
-    if pick_id in (WP_ID_XY, WP_ID_XZ, WP_ID_YZ):
+    if pick_id in _PART_PLANE_IDS:
+        h *= PART_PLANE_SIZE_FACTOR
+    if pick_id in (WP_ID_XY, WP_ID_XZ, WP_ID_YZ) + _PART_PLANE_IDS:
         gap = h * WP_ORIGIN_GAP_FRACTION
         side = 2.0 * h
         return gap, gap, gap + side, gap + side
@@ -209,6 +249,35 @@ def resolve_sketch_base(context, coords):
 # ---------------------------------------------------------------------------
 
 
+# Stamped on every workplane Empty this addon creates, so a workplane the user
+# placed themselves is never silently deleted or re-anchored.
+MANAGED_WP_KEY = "slvs:managed_wp"
+
+
+def mark_managed_workplane(empty) -> None:
+    """Record that this addon created ``empty`` as a workplane."""
+    empty[MANAGED_WP_KEY] = True
+
+
+def is_managed_workplane(empty) -> bool:
+    """Whether this addon created ``empty`` (and so may retire it)."""
+    return bool(empty is not None and empty.get(MANAGED_WP_KEY, False))
+
+
+def hide_managed_workplane(empty, context) -> None:
+    """Take a workplane we created out of the viewport, keeping it pickable.
+
+    ``hide_set`` needs the object present in the view layer, and linking alone
+    does not resync it, so the layer is updated first. A failure is not worth
+    aborting a pick over: a visible workplane still works.
+    """
+    context.view_layer.update()
+    try:
+        _hide_managed_empty(empty, context.scene)
+    except RuntimeError:
+        logger.warning("Could not hide workplane '%s'", empty.name)
+
+
 def _hide_managed_empty(empty, scene):
     """Hide an addon-managed workplane empty without dropping it from eval.
 
@@ -252,19 +321,18 @@ def ensure_workplane_empty(sketch):
     name = f"WP_{sketch.name}"
     empty = bpy.data.objects.new(name, None)
     empty.empty_display_type = "SINGLE_ARROW"
+    mark_managed_workplane(empty)
     empty.lock_location = (True, True, True)
     empty.lock_rotation = (True, True, True)
     empty.lock_scale = (True, True, True)
     empty.matrix_world = sketch.wp.matrix_basis
 
     scene = bpy.context.scene
-    from .collections import link_loose_workplane, nest_workplane
+    from .collections import link_to_scene_root
 
-    # Group the workplane with its sketch when the sketch object exists; otherwise
-    # keep it at the scene level until a sketch claims it.
-    target = getattr(sketch, "target_object", None)
-    if target is None or nest_workplane(empty, target) is None:
-        link_loose_workplane(empty, scene)
+    # Scene level to start with; the part sync claims it once its sketch is in a
+    # part.
+    link_to_scene_root(empty, scene)
 
     # Hide only after linking: hide_set needs the object in the view layer.
     _hide_managed_empty(empty, scene)
@@ -354,13 +422,8 @@ def get_workplane_origin_normal(sketch):
     Returns:
         tuple: (origin: Vector, normal: Vector) or (None, None)
     """
-    wp_obj = sketch.workplane_object if sketch else None
+    if not sketch:
+        return None, None
 
-    if not wp_obj and sketch and sketch.target_object and sketch.target_object.parent:
-        wp_obj = sketch.target_object.parent
-
-    if wp_obj:
-        mat = wp_obj.matrix_world
-        return mat.translation.copy(), Vector(mat.col[2][:3]).normalized()
-
-    return None, None
+    mat = sketch.plane_matrix
+    return mat.translation.copy(), Vector(mat.col[2][:3]).normalized()
