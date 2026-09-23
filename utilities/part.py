@@ -217,7 +217,6 @@ def rehome_children(root: bpy.types.Object) -> Optional[bpy.types.Object]:
 
     Returns the new root, or None when nothing is left to root the part.
     """
-    from ..model.sketch_ref import is_sketch_object
 
     members = list(root.children_recursive)
     # Freeze every member's world transform before any re-parenting, so each one
@@ -227,7 +226,7 @@ def rehome_children(root: bpy.types.Object) -> Optional[bpy.types.Object]:
     for child in root.children:
         _bake_world_transform(child)
 
-    successor = next((m for m in members if is_sketch_object(m)), None)
+    successor = _successor(members)
     if successor is None:
         return None
 
@@ -239,6 +238,22 @@ def rehome_children(root: bpy.types.Object) -> Optional[bpy.types.Object]:
         if member != successor and member.parent is None:
             join_part(successor, member)
     return successor
+
+
+def _successor(members) -> Optional[bpy.types.Object]:
+    """Which of these should root the part now that its root has gone.
+
+    A body first: a part is anchored in the mesh its sketches are realised on, so
+    handing the part to a sketch would leave it rooted in something that carries
+    no geometry. A sketch is the fallback, for files that predate bodies.
+    """
+    from ..model.sketch_ref import is_sketch_object
+    from .body import is_body
+
+    return next(
+        (m for m in members if is_body(m)),
+        next((m for m in members if is_sketch_object(m)), None),
+    )
 
 
 def _promote(obj: bpy.types.Object) -> None:
@@ -269,11 +284,15 @@ def _is_managed_member(obj: bpy.types.Object) -> bool:
 def transform_owner(obj: bpy.types.Object) -> bpy.types.Object:
     """The object that actually owns ``obj``'s transform.
 
-    A free-3D sketch is placed by an origin Empty and keeps its own transform
-    locked, so the Empty is what a part must be rooted in and what an assembly
-    must carry: rooting the sketch itself would leave two movable things
-    disagreeing about where the part is.
+    A sketch never owns its own: it sits on a workplane, and that workplane hangs
+    under the body its geometry is realised on, so the body is what a part is
+    rooted in and what an assembly carries. Rooting the sketch instead would
+    leave two movable things disagreeing about where the part is.
+
+    A free-3D sketch is placed by an origin Empty, which plays the same role.
     """
+    from .body import body_of
+
     parent = obj.parent
     if (
         parent is not None
@@ -281,7 +300,9 @@ def transform_owner(obj: bpy.types.Object) -> bpy.types.Object:
         and parent.get("is_3d_sketch_origin", False)
     ):
         return parent
-    return obj
+
+    body = body_of(obj)
+    return body if body is not None else obj
 
 
 def promote_to_root(obj: bpy.types.Object) -> None:
@@ -408,7 +429,6 @@ def reconcile_parts(scene: bpy.types.Scene) -> bool:
 
     Returns True if anything changed.
     """
-    from ..model.sketch_ref import is_sketch_object
     from .collections import is_editable
 
     roots = {
@@ -464,7 +484,7 @@ def reconcile_parts(scene: bpy.types.Scene) -> bool:
                 if member.parent is None:
                     _restore_world(member, root_matrix)
 
-        successor = next((m for m in stranded if is_sketch_object(m)), None)
+        successor = _successor(stranded)
         if successor is not None:
             # Lift the successor clear of whatever placed it before it can take
             # members on: leaving it parented to one would close a parent cycle.
@@ -551,8 +571,8 @@ def _refresh_cutter_display(scene: bpy.types.Scene, touched) -> None:
             update_cutter_display(obj, bodies, True)
 
 
-def ensure_part_planes(context, root: bpy.types.Object) -> list:
-    """Create (once) and return ``root``'s own base plane empties, in axis order.
+def ensure_part_plane(context, root: bpy.types.Object, axis: str):
+    """Create (once) and return ``root``'s base plane for one axis.
 
     A part that has been moved or rotated needs planes in *its* frame to sketch
     on, not the world's. They are ordinary workplane empties parented into the
@@ -560,41 +580,45 @@ def ensure_part_planes(context, root: bpy.types.Object) -> list:
     workplane; they are hidden and unselectable like the origin planes so they
     stay out of the way.
 
+    One at a time, because a sketch needs only the plane it sits on: the other
+    two are worth creating when the picker offers them, not before.
+
     Created from operator context only (never a depsgraph handler, which must not
     add objects), which is why the Add Sketch tool asks for them as it starts.
     """
     from .collections import link_to_scene_root
     from .workplane import hide_managed_workplane, mark_managed_workplane
 
-    planes = []
-    created = []
-    for axis, euler in PART_PLANE_AXES:
-        empty = existing_part_plane(root, axis)
-        if empty is None:
-            empty = bpy.data.objects.new(f"{root.name} {axis}", None)
-            empty.empty_display_type = "PLAIN_AXES"
-            empty.empty_display_size = 0.25
-            empty[PART_PLANE_KEY] = axis
-            mark_managed_workplane(empty)
-            link_to_scene_root(empty, context.scene)
-            # Plain parenting, not join_part: these planes are *defined* by the
-            # part's frame, so they must inherit it rather than keep a world
-            # position of their own.
-            empty.parent = root
-            empty.matrix_parent_inverse = Matrix.Identity(4)
-            empty.matrix_basis = Euler(euler).to_matrix().to_4x4()
-            fix_transform(empty)
-            created.append(empty)
-        planes.append(empty)
+    empty = existing_part_plane(root, axis)
+    if empty is not None:
+        return empty
 
-    for empty in created:
-        hide_managed_workplane(empty, context)
-    return planes
+    euler = dict(PART_PLANE_AXES)[axis]
+    empty = bpy.data.objects.new(f"{root.name} {axis}", None)
+    empty.empty_display_type = "PLAIN_AXES"
+    empty.empty_display_size = 0.25
+    empty[PART_PLANE_KEY] = axis
+    mark_managed_workplane(empty)
+    link_to_scene_root(empty, context.scene)
+    # Plain parenting, not join_part: these planes are *defined* by the part's
+    # frame, so they must inherit it rather than keep a world position of their
+    # own.
+    empty.parent = root
+    empty.matrix_parent_inverse = Matrix.Identity(4)
+    empty.matrix_basis = Euler(euler).to_matrix().to_4x4()
+    fix_transform(empty)
+    hide_managed_workplane(empty, context)
+    return empty
+
+
+def ensure_part_planes(context, root: bpy.types.Object) -> list:
+    """``root``'s three base planes, in axis order, creating any it lacks."""
+    return [ensure_part_plane(context, root, axis) for axis, _euler in PART_PLANE_AXES]
 
 
 def part_plane_objects(context) -> list:
-    """The base planes of the part in focus, or an empty list if there is none."""
-    root = focused_part(context)
+    """The base planes of whatever is in focus, or an empty list if nothing is."""
+    root = focused_frame(context)
     if root is None:
         return []
     return [
@@ -616,31 +640,56 @@ def strip_part_plane(obj: bpy.types.Object) -> None:
     obj.hide_set(False)
 
 
-def focused_part(context) -> Optional[bpy.types.Object]:
-    """The part the user is working on, or None.
+def focused_frame(context) -> Optional[bpy.types.Object]:
+    """The object whose own base planes to offer, or None for the world's.
 
-    Read from the active sketch first, then from the selection, so which part's
-    planes are offered is always something visible on screen rather than a mode
-    the user has to keep in mind.
-
-    Only *selected* objects count. Blender leaves an object active after it is
-    deselected, so consulting the active object alone would make focus stick:
-    clicking empty space would never get you back to the world planes.
+    The part in focus, and otherwise the body in focus: a body carries its own
+    transform from the moment it exists, so sketching on one that has been moved
+    should mean its frame whether or not it has been made solid yet. Membership
+    still settles later; this only decides which planes are on screen.
     """
+    root = focused_part(context)
+    if root is not None:
+        return root
+
+    from .body import body_of, is_body
+
+    for obj in _focus_candidates(context):
+        if is_body(obj):
+            return obj
+        body = body_of(obj)
+        if body is not None:
+            return body
+    return None
+
+
+def _focus_candidates(context):
+    """What the user is pointing at: the active sketch, then their selection."""
     from ..model.sketch_ref import get_active_sketch
 
     sketch = get_active_sketch(context)
     if sketch is not None:
-        root = part_root_of(sketch.target_object)
-        if root is not None:
-            return root
+        yield sketch.target_object
 
     selected = list(context.selected_objects)
     active = context.active_object
     if active is not None and active in selected:
         selected.insert(0, active)
+    yield from selected
 
-    for obj in selected:
+
+def focused_part(context) -> Optional[bpy.types.Object]:
+    """The part the user is working on, or None.
+
+    Read from the active sketch first, then from the selection, so what is in
+    focus is always something visible on screen rather than a mode the user has
+    to keep in mind.
+
+    Only *selected* objects count. Blender leaves an object active after it is
+    deselected, so consulting the active object alone would make focus stick:
+    clicking empty space would never get you back to the world planes.
+    """
+    for obj in _focus_candidates(context):
         root = part_root_of(obj)
         if root is not None:
             return root
@@ -699,7 +748,11 @@ def _bodies_by_cutter(scene: bpy.types.Scene) -> dict:
 
 
 def _has_solid_feature(obj: bpy.types.Object) -> bool:
-    """Whether a sketch has been made solid (an extrude or revolve modifier)."""
+    """Whether this has been made solid (an extrude or revolve modifier).
+
+    Asked of the transform owner, not the sketch: the stack lives on the body a
+    sketch is realised on.
+    """
     from .extrude_nodes import EXTRUDE_NODE_GROUP
     from .revolve_nodes import REVOLVE_NODE_GROUP
 
@@ -745,7 +798,9 @@ def needs_part_migration(scene: bpy.types.Scene) -> bool:
         if part_root_of(transform_owner(obj)) is not None:
             continue
         source = sketch_source_body(sketch)
-        if (source is not None and source != obj) or _has_solid_feature(obj):
+        if (source is not None and source != obj) or _has_solid_feature(
+            transform_owner(obj)
+        ):
             return True
     return False
 
@@ -785,7 +840,7 @@ def migrate_parts(scene: bpy.types.Scene) -> bool:
             changed = True
             continue
 
-        if _has_solid_feature(obj):
+        if _has_solid_feature(owner):
             promote_to_root(owner)
             changed = True
 
@@ -912,6 +967,17 @@ def _redirect_references(copy: bpy.types.Object, copies: dict) -> None:
     plane = copy.slvs_workplane
     if plane is not None and plane.name in copies:
         copy.slvs_workplane = copies[plane.name]
+
+    # A copied body must read the copied sketch, not the original's.
+    from .body import BODY_SKETCH_KEY, bind_body_to_sketch, is_body
+
+    source_sketch = copy.get(BODY_SKETCH_KEY)
+    if is_body(copy) and isinstance(source_sketch, bpy.types.Object):
+        if source_sketch.name in copies:
+            copied_sketch = copies[source_sketch.name]
+            copy[BODY_SKETCH_KEY] = copied_sketch
+            copied_sketch.slvs_body = copy
+            bind_body_to_sketch(copy, copied_sketch)
 
     source = copy.get(KEY_SOURCE)
     if isinstance(source, bpy.types.Object) and source.name in copies:
