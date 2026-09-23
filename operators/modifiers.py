@@ -131,7 +131,13 @@ def boolean_cutters(obj):
         group = getattr(m, "node_group", None)
         if m.type != "NODES" or group is None or group.name != BOOLEAN_NODE_GROUP:
             continue
-        cutter = get_modifier_input(m, boolean_input_ids(group)["Cutter"])
+        # A linked group keeps the interface it was built with, so the socket
+        # may not be there at all; reading it is not worth an exception in a
+        # handler-driven path.
+        cutter_id = boolean_input_ids(group).get("Cutter")
+        if cutter_id is None:
+            continue
+        cutter = get_modifier_input(m, cutter_id)
         if cutter is not None:
             cutters.append(cutter)
     return cutters
@@ -191,8 +197,28 @@ def apply_boolean(
     set_boolean_operation(mod, ids["Operation"], operation)
     set_modifier_input(mod, ids["Self Intersection"], self_intersection)
     set_modifier_input(mod, ids["Hole Tolerant"], hole_tolerant)
-    set_boolean_solver(mod, ids[SOLVER_SOCKET], solver or default_boolean_solver())
+    set_boolean_solver(mod, ids[SOLVER_SOCKET], _solver_for(body, cutter, solver))
     return mod
+
+
+def _solver_for(body, cutter, solver=None):
+    """The boolean solver to use, honouring the choice unless it would delete.
+
+    Manifold is the fast solver, but it drops an operand that is not a closed
+    volume: cutting a flat profile with it leaves nothing at all instead of a
+    profile with a hole. Exact handles that, so an open operand forces it. The
+    modifier keeps the solver as an input, so it can still be changed by hand.
+    """
+    from ..utilities.boolean_targets import is_closed_solid
+
+    chosen = solver or default_boolean_solver()
+    if chosen != "Manifold":
+        return chosen
+
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    if all(is_closed_solid(obj, depsgraph) for obj in (body, cutter)):
+        return chosen
+    return "Exact"
 
 
 class BooleanTargetItem(PropertyGroup):
@@ -253,13 +279,22 @@ class BooleanFromToolMixin:
         cutter = cutter.original
 
         from ..model.sketch_ref import Sketch
+
+        # The tool works on the body; its sketch is what carries provenance (what
+        # it was drawn on), so resolve back to it.
+        from ..utilities.body import is_body, sketch_of
         from ..utilities.boolean_targets import (
             default_operation,
             detect_targets,
             sketch_source_body,
         )
 
-        sketch = Sketch(cutter) if cutter.type == "CURVES" else None
+        if cutter.type == "CURVES":
+            sketch = Sketch(cutter)
+        elif is_body(cutter) and sketch_of(cutter) is not None:
+            sketch = Sketch(sketch_of(cutter))
+        else:
+            sketch = None
 
         auto = context.scene.sketcher.use_auto_boolean
         if not self.boolean_detected and not auto:
@@ -306,12 +341,17 @@ class BooleanFromToolMixin:
         enabled_bodies = self._apply_boolean_targets(cutter)
 
         # Making a sketch solid is what settles which part it belongs to: a cut
-        # joins the part it cuts, a standalone solid roots one. A mesh cutter is
-        # left alone -- a part with its own history stays a part.
+        # joins the part it cuts, a standalone solid roots one. A mesh cutter that
+        # is not a sketch's body is left alone: a part with its own history stays
+        # a part.
         if sketch is not None:
-            from ..utilities.part import settle_membership
+            from ..utilities.part import ensure_part_planes, settle_membership
 
-            settle_membership(cutter, enabled_bodies)
+            root = settle_membership(cutter, enabled_bodies)
+            if root is not None:
+                # A part that has just been born gets its base planes now, so
+                # they are there to sketch on rather than appearing later.
+                ensure_part_planes(context, root)
 
         from ..utilities.part import update_cutter_display
 
@@ -382,8 +422,22 @@ BASE_STATES = (
 
 
 def is_2d_profile(obj):
-    """A sketch or curve object — a valid 2D profile to extrude (not a 3D mesh)."""
-    return obj is not None and obj.type in {"CURVE", "CURVES"}
+    """Something a solid can be made from: a curve, or a sketch's body.
+
+    A sketch is picked, but the stack goes on the mesh its geometry is realised
+    on (see utilities.body): a Curves object cannot hold a stack that outputs
+    mesh, since Blender then refuses to apply it (issue #723).
+    """
+    from ..utilities.body import is_body
+
+    return obj is not None and (obj.type == "CURVE" or is_body(obj))
+
+
+def solid_target(obj):
+    """The object a solid feature belongs on: a picked sketch means its body."""
+    from ..utilities.body import body_of
+
+    return body_of(obj) or obj
 
 
 class NodeOperator(Operator3d):
@@ -598,7 +652,7 @@ class NodeOperator(Operator3d):
             self.previous_modifier = self._modifier_name()
 
     def main(self, context):
-        ob = self.resolved_object()
+        ob = solid_target(self.resolved_object())
         if not self.is_valid_target(ob):
             self.report({"WARNING"}, self.invalid_target_msg)
             return False
@@ -924,7 +978,8 @@ class View3D_OT_node_revolve(Operator, BooleanFromToolMixin, NodeOperator):
         *BASE_STATES,
         state_from_args(
             "Axis",
-            description="Click a mesh edge or curve/sketch line to revolve around",
+            description="Click an axis, a mesh edge or a curve/sketch line to "
+            "revolve around",
             pointer="axis",
             types=(MeshEdge,),
             use_create=False,
@@ -954,8 +1009,21 @@ class View3D_OT_node_revolve(Operator, BooleanFromToolMixin, NodeOperator):
         return True
 
     def fini(self, context: Context, succeede: bool):
+        from .. import global_data
+
+        global_data.axis_picker = False
+        global_data.hover_axis = None
         if succeede:
             self.finish_booleans(context)
+
+    def set_state(self, context: Context, index: int):
+        super().set_state(context, index)
+        # The axes are only worth drawing while one is being picked.
+        from .. import global_data
+
+        global_data.axis_picker = self.get_states()[index].name == "Axis"
+        if not global_data.axis_picker:
+            global_data.hover_axis = None
 
     def get_point(self, context, index):
         # The axis is a picked edge, resolved to endpoints in set_props; there
@@ -970,7 +1038,9 @@ class View3D_OT_node_revolve(Operator, BooleanFromToolMixin, NodeOperator):
         result = super().pick_element(context, coords)
         if result is not None:
             return result
+
         from ..utilities.view import curve_segment_under_cursor
+        from ..utilities.workplane import hit_test_axis
 
         radius = 12.0 * context.preferences.system.ui_scale
         hit = curve_segment_under_cursor(context, coords, radius)
@@ -978,10 +1048,22 @@ class View3D_OT_node_revolve(Operator, BooleanFromToolMixin, NodeOperator):
             obj, point_index = hit
             self.state_data["type"] = MeshEdge
             return obj.name, point_index
+
+        # A base plane's own direction: revolving around a part's X or Z is the
+        # common case, and there is rarely an edge lying on it to click instead.
+        # The plane empty is the pointer, so the axis follows the part it is in.
+        _pick_id, plane, index = hit_test_axis(context, coords, radius)
+        if plane is not None:
+            self.state_data["type"] = MeshEdge
+            return plane.name, index
         return None
 
     def _axis_endpoints(self):
-        """World endpoints of the picked axis edge (mesh or curve), or None."""
+        """World endpoints of the picked axis, or None.
+
+        A mesh edge, a curve segment, or one of a base plane's own directions
+        (picked as the plane empty plus which direction it is).
+        """
         try:
             ob_name, index = self.get_state_pointer(index=1, implicit=True)
         except Exception:
@@ -989,6 +1071,10 @@ class View3D_OT_node_revolve(Operator, BooleanFromToolMixin, NodeOperator):
         ob = bpy.data.objects.get(ob_name)
         if ob is None:
             return None
+        if ob.type == "EMPTY":
+            from ..utilities.workplane import axis_endpoints
+
+            return axis_endpoints(ob, index)
         if ob.type in {"CURVE", "CURVES"}:
             pts = getattr(ob.data, "points", None)
             if pts is None or index + 1 >= len(pts):
@@ -1269,7 +1355,11 @@ class View3D_OT_node_boolean(Operator, NodeOperator):
 
         body = self.resolved_object()
         if body is not None and is_sketch_object(cutter):
-            settle_membership(cutter, [body.original])
+            from ..utilities.part import ensure_part_planes
+
+            root = settle_membership(cutter, [body.original])
+            if root is not None:
+                ensure_part_planes(context, root)
             sync_part_collections(context.scene)
 
     def set_props(self):
