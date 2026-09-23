@@ -22,6 +22,10 @@ _LABEL_HEIGHT_FACTOR = 0.22
 # A plane that is not a base plane is a lesser thing to pick, so its name is
 # drawn smaller.
 _NAME_HEIGHT_FACTOR = 0.10
+# How far the name is inset from the plane's corner, in corner margins: enough
+# that it reads as inside the rectangle with air around it, rather than sitting
+# against its edge.
+_NAME_INSET = 2.5
 # Space between those lines, as a fraction of one line's height.
 _LABEL_LINE_GAP = 0.2
 # Inset of the label from the plane's outer corner, as a fraction of its side.
@@ -217,17 +221,64 @@ def draw_hover_element():
         _draw_curve_element_hover(ob, index, col, scale)
 
 
+def _text_block(lines, size):
+    """Measure ``lines`` at ``size``: per-line dims, total width and height."""
+    dims = []
+    for line in lines:
+        blf.size(_FONT_ID, size)
+        dims.append(blf.dimensions(_FONT_ID, line))
+    line_h = max(h for _w, h in dims)
+    gap = line_h * _LABEL_LINE_GAP
+    width = max(w for w, _h in dims)
+    height = sum(h for _w, h in dims) + gap * (len(dims) - 1)
+    return dims, gap, width, height
+
+
+def _draw_text_block(plane_mat, lines, dims, gap, size, scale, sx, x, y, centered):
+    """Draw a measured block in plane space, anchored at its bottom-left.
+
+    ``x``/``y`` are that corner in the plane's own coordinates, ``sx`` mirrors
+    the glyphs when the plane is seen from behind, and ``centered`` centres each
+    line on ``x`` instead of starting there.
+    """
+    width = max(w for w, _h in dims)
+    height = sum(h for _w, h in dims) + gap * (len(dims) - 1)
+    # Mirroring flips the direction text grows in, so the anchor moves with it.
+    origin_x = x - (width * scale / 2.0 if centered else 0.0) * (
+        1.0 if sx > 0 else -1.0
+    )
+    mat = (
+        plane_mat
+        @ Matrix.Translation((origin_x, y, 0.0))
+        @ Matrix.Scale(scale, 4)
+        @ Matrix.Diagonal((sx, 1.0, 1.0, 1.0))
+    )
+    with gpu.matrix.push_pop():
+        gpu.matrix.multiply_matrix(mat)
+        blf.size(_FONT_ID, size)
+        cursor = height
+        for line, (_line_w, line_h) in zip(lines, dims):
+            cursor -= line_h
+            blf.position(_FONT_ID, 0.0, cursor, 0.0)
+            blf.draw(_FONT_ID, line)
+            cursor -= gap
+
+
 def draw_origin_labels():
-    """POST_VIEW: name each origin workplane (XY/XZ/YZ), lying in its plane.
+    """POST_VIEW: name each workplane, lying in its plane.
 
     Drawn in the 3D pass so ``blf`` is transformed by the plane's matrix and the
     text tilts with it in perspective. Visibility mirrors the workplane gizmo:
     only while the Add Sketch tool is active, and ``iter_wp_empties`` already
-    respects ``show_origin``. The glyph raster is sized to the label's on-screen
-    height so it stays crisp instead of being magnified; the text sits in the
-    plane's outer corner, uses the themed constraint-text color, is mirrored
-    when seen from behind so it never reads backwards, and skips the depth test
-    so it stays legible over geometry.
+    respects ``show_origin``.
+
+    A base plane says the axis, large and in the middle where the eye lands, and
+    whose plane it is in its outer corner, inset so the name sits inside the
+    rectangle instead of over its edge. A plane that has only a name shows it in
+    that same corner. The glyph raster is
+    sized to the on-screen height so it stays crisp instead of being magnified,
+    the text is mirrored when seen from behind so it never reads backwards, and
+    it skips the depth test so it stays legible over geometry.
     """
     from .declarations import GizmoGroups
     from .drawing import selection
@@ -262,75 +313,83 @@ def draw_origin_labels():
 
         min_x, min_y, max_x, max_y = wp_plane_bounds(context, pick_id)
         side = max_x - min_x
-        # Every label breaks the same way; only the size says how prominent the
-        # plane is, base planes being what you usually pick.
-        lines = label_lines(label)
         base = is_base_plane(pick_id)
-        target_h = side * (_LABEL_HEIGHT_FACTOR if base else _NAME_HEIGHT_FACTOR)
+        lines = label_lines(label)
+        # On a base plane the last line is the axis; the rest name the owner.
+        axis_line = lines[-1] if base else None
+        name_lines = lines[:-1] if base else lines
 
         plane_mat = wp_obj.matrix_world
         up_world = plane_mat.to_3x3().col[1].normalized()
-        corner = plane_mat @ Vector((max_x, max_y, 0.0))
+        center = plane_mat @ Vector(((min_x + max_x) / 2.0, (min_y + max_y) / 2.0, 0.0))
 
-        # Raster the glyphs at their on-screen pixel height so they stay sharp:
-        # magnifying a small raster into world space is what made them blurry.
-        s0 = location_3d_to_region_2d(region, rv3d, corner)
-        s1 = location_3d_to_region_2d(region, rv3d, corner + up_world * target_h)
-        if s0 is None or s1 is None:  # behind the view plane
-            continue
-        blf.size(_FONT_ID, max(8, min(round((s1 - s0).length), 256)))
-
-        dims = [blf.dimensions(_FONT_ID, line) for line in lines]
-        line_h = max(h for _w, h in dims)
-        if line_h <= 0.0:
-            continue
-        gap = line_h * _LABEL_LINE_GAP
-        w = max(_w for _w, _h in dims)
-        h = line_h * len(lines) + gap * (len(lines) - 1)
-
-        # Anchor the text box's outer corner a margin in from the plane's outer
-        # corner, so it reads as a corner label rather than filling the plane.
-        margin = side * _LABEL_CORNER_MARGIN
-
-        # Fit by width as well as height: a longer label (an origin plane says so)
-        # would otherwise keep its glyph height and run off the plane's edge.
-        scale = target_h / line_h
-        usable = side - 2.0 * margin
-        if w > 0.0 and w * scale > usable:
-            scale = usable / w
-        box_cx = max_x - margin - (w * scale) / 2
-        box_cy = max_y - margin - (h * scale) / 2
+        def raster_for(height):
+            """Glyph size in pixels for ``height`` world units at this plane."""
+            s0 = location_3d_to_region_2d(region, rv3d, center)
+            s1 = location_3d_to_region_2d(region, rv3d, center + up_world * height)
+            if s0 is None or s1 is None:  # behind the view plane
+                return None
+            return max(8, min(round((s1 - s0).length), 256))
 
         normal = plane_mat.to_3x3().col[2].normalized()
         # Flip in-plane X when looking at the plane's back so the glyphs read
         # left-to-right from the viewer's side instead of mirrored.
         sx = -1.0 if normal.dot(view_forward) > 0.0 else 1.0
-
-        # Right-to-left: center the glyph box, mirror if needed, scale to world,
-        # move to the corner anchor, then into the plane's frame.
-        mat = (
-            plane_mat
-            @ Matrix.Translation((box_cx, box_cy, 0.0))
-            @ Matrix.Scale(scale, 4)
-            @ Matrix.Diagonal((sx, 1.0, 1.0, 1.0))
-            @ Matrix.Translation((-w / 2, -h / 2, 0.0))
-        )
+        margin = side * _LABEL_CORNER_MARGIN
+        usable = side - 2.0 * margin
 
         # Axis-tinted, lightened toward white so the text reads a bit softer
         # than the plane fill, brighter still while hovered.
-        axis = workplane_color(pick_id)
-        lift = 0.55 if selection.hover == pick_id else 0.35
-        color = tuple(c + (1.0 - c) * lift for c in axis) + (1.0,)
-        blf.color(_FONT_ID, *color)
+        hovered = selection.hover == pick_id
+        tint = workplane_color(pick_id)
+        lift = 0.55 if hovered else 0.35
+        blf.color(_FONT_ID, *(tuple(c + (1.0 - c) * lift for c in tint) + (1.0,)))
 
-        with gpu.matrix.push_pop():
-            gpu.matrix.multiply_matrix(mat)
-            for i, (line, _dim) in enumerate(zip(lines, dims)):
-                # Stacked downwards from the top of the box, flush left: a
-                # centred second line reads as a separate label.
-                y = h - line_h - i * (line_h + gap)
-                blf.position(_FONT_ID, 0.0, y, 0.0)
-                blf.draw(_FONT_ID, line)
+        if axis_line is not None:
+            size = raster_for(side * _LABEL_HEIGHT_FACTOR)
+            if size is not None:
+                dims, gap, width, height = _text_block([axis_line], size)
+                scale = (side * _LABEL_HEIGHT_FACTOR) / height
+                if width > 0.0 and width * scale > usable:
+                    scale = usable / width
+                _draw_text_block(
+                    plane_mat,
+                    [axis_line],
+                    dims,
+                    gap,
+                    size,
+                    scale,
+                    sx,
+                    (min_x + max_x) / 2.0,
+                    (min_y + max_y) / 2.0 - height * scale / 2.0,
+                    "center",
+                )
+
+        if name_lines:
+            size = raster_for(side * _NAME_HEIGHT_FACTOR)
+            if size is not None:
+                dims, gap, width, height = _text_block(name_lines, size)
+                line_h = max(h for _w, h in dims)
+                scale = (side * _NAME_HEIGHT_FACTOR) / line_h
+                if width > 0.0 and width * scale > usable:
+                    scale = usable / width
+                # Inset from the outer corner, so the name sits inside the
+                # rectangle rather than running over its edge. Seen from behind
+                # the outer side is the plane's own -X one.
+                inset = margin * _NAME_INSET
+                x = max_x - inset if sx > 0 else min_x + inset
+                _draw_text_block(
+                    plane_mat,
+                    name_lines,
+                    dims,
+                    gap,
+                    size,
+                    scale,
+                    sx,
+                    x,
+                    max_y - inset - height * scale,
+                    "right",
+                )
 
     gpu.state.depth_test_set("LESS_EQUAL")
     gpu.state.blend_set("NONE")

@@ -950,3 +950,59 @@ class TestPartRoot(BgsTestCase):
             self.assertIsNotNone(existing_part_plane(body, axis), axis)
         # The one it was drawn on is the XY, not a fourth plane.
         self.assertEqual(existing_part_plane(body, "XY"), plane)
+
+    def test_cutting_a_plain_mesh_leaves_one_plane_in_that_place(self):
+        # Reported: extruding a sketch into the default cube left the sketch's
+        # own workplane sitting on the new part's XY. The part's planes have to
+        # exist before the joining body's plane is matched against them.
+        from ..utilities.body import body_of
+        from ..utilities.part import existing_part_plane, settle_membership
+        from ..utilities.workplane import is_managed_workplane
+
+        cube = self._cube("Cube")  # never touched by CAD Sketcher before
+        sketch = build_sketch_on_workplane(self.context, self.datum)
+        cutter = body_of(sketch.target_object)
+
+        settle_membership(sketch.target_object, [cube], self.context)
+
+        self.assertTrue(is_part_root(cube))
+        self.assertEqual(part_root_of(cutter), cube)
+        # Its base planes are there, and the cutter's sketch sits on the XY
+        # rather than on a second plane in the same place.
+        for axis in ("XY", "XZ", "YZ"):
+            self.assertIsNotNone(existing_part_plane(cube, axis), axis)
+        self.assertEqual(
+            sketch.target_object.slvs_workplane, existing_part_plane(cube, "XY")
+        )
+        planes = [c for c in cube.children_recursive if is_managed_workplane(c)]
+        self.assertEqual(len(planes), 3)
+
+    def test_a_cut_leaves_the_part_selected(self):
+        # The cutter is hidden once it cuts, so holding it would leave the user
+        # with nothing selectable; what shows the result is the part.
+        from ..operators.modifiers import select_result
+        from ..utilities.body import body_of
+        from ..utilities.part import settle_membership
+
+        cube = self._cube("Cube")
+        sketch = build_sketch_on_workplane(self.context, self.datum)
+        cutter = body_of(sketch.target_object)
+        settle_membership(sketch.target_object, [cube], self.context)
+
+        select_result(self.context, cutter)
+
+        self.assertEqual(self.context.view_layer.objects.active, cube)
+        self.assertTrue(cube.select_get())
+        self.assertFalse(cutter.select_get())
+
+    def test_a_standalone_solid_leaves_itself_selected(self):
+        from ..operators.modifiers import select_result
+        from ..utilities.body import body_of
+
+        sketch = build_sketch_on_workplane(self.context, self.datum)
+        body = body_of(sketch.target_object)
+        mark_part_root(body)
+
+        select_result(self.context, body)
+
+        self.assertEqual(self.context.view_layer.objects.active, body)
