@@ -217,7 +217,6 @@ def rehome_children(root: bpy.types.Object) -> Optional[bpy.types.Object]:
 
     Returns the new root, or None when nothing is left to root the part.
     """
-    from ..model.sketch_ref import is_sketch_object
 
     members = list(root.children_recursive)
     # Freeze every member's world transform before any re-parenting, so each one
@@ -227,7 +226,7 @@ def rehome_children(root: bpy.types.Object) -> Optional[bpy.types.Object]:
     for child in root.children:
         _bake_world_transform(child)
 
-    successor = next((m for m in members if is_sketch_object(m)), None)
+    successor = _successor(members)
     if successor is None:
         return None
 
@@ -239,6 +238,22 @@ def rehome_children(root: bpy.types.Object) -> Optional[bpy.types.Object]:
         if member != successor and member.parent is None:
             join_part(successor, member)
     return successor
+
+
+def _successor(members) -> Optional[bpy.types.Object]:
+    """Which of these should root the part now that its root has gone.
+
+    A body first: a part is anchored in the mesh its sketches are realised on, so
+    handing the part to a sketch would leave it rooted in something that carries
+    no geometry. A sketch is the fallback, for files that predate bodies.
+    """
+    from ..model.sketch_ref import is_sketch_object
+    from .body import is_body
+
+    return next(
+        (m for m in members if is_body(m)),
+        next((m for m in members if is_sketch_object(m)), None),
+    )
 
 
 def _promote(obj: bpy.types.Object) -> None:
@@ -269,11 +284,15 @@ def _is_managed_member(obj: bpy.types.Object) -> bool:
 def transform_owner(obj: bpy.types.Object) -> bpy.types.Object:
     """The object that actually owns ``obj``'s transform.
 
-    A free-3D sketch is placed by an origin Empty and keeps its own transform
-    locked, so the Empty is what a part must be rooted in and what an assembly
-    must carry: rooting the sketch itself would leave two movable things
-    disagreeing about where the part is.
+    A sketch never owns its own: it sits on a workplane, and that workplane hangs
+    under the body its geometry is realised on, so the body is what a part is
+    rooted in and what an assembly carries. Rooting the sketch instead would
+    leave two movable things disagreeing about where the part is.
+
+    A free-3D sketch is placed by an origin Empty, which plays the same role.
     """
+    from .body import body_of
+
     parent = obj.parent
     if (
         parent is not None
@@ -281,7 +300,9 @@ def transform_owner(obj: bpy.types.Object) -> bpy.types.Object:
         and parent.get("is_3d_sketch_origin", False)
     ):
         return parent
-    return obj
+
+    body = body_of(obj)
+    return body if body is not None else obj
 
 
 def promote_to_root(obj: bpy.types.Object) -> None:
@@ -408,7 +429,6 @@ def reconcile_parts(scene: bpy.types.Scene) -> bool:
 
     Returns True if anything changed.
     """
-    from ..model.sketch_ref import is_sketch_object
     from .collections import is_editable
 
     roots = {
@@ -464,7 +484,7 @@ def reconcile_parts(scene: bpy.types.Scene) -> bool:
                 if member.parent is None:
                     _restore_world(member, root_matrix)
 
-        successor = next((m for m in stranded if is_sketch_object(m)), None)
+        successor = _successor(stranded)
         if successor is not None:
             # Lift the successor clear of whatever placed it before it can take
             # members on: leaving it parented to one would close a parent cycle.
@@ -699,7 +719,11 @@ def _bodies_by_cutter(scene: bpy.types.Scene) -> dict:
 
 
 def _has_solid_feature(obj: bpy.types.Object) -> bool:
-    """Whether a sketch has been made solid (an extrude or revolve modifier)."""
+    """Whether this has been made solid (an extrude or revolve modifier).
+
+    Asked of the transform owner, not the sketch: the stack lives on the body a
+    sketch is realised on.
+    """
     from .extrude_nodes import EXTRUDE_NODE_GROUP
     from .revolve_nodes import REVOLVE_NODE_GROUP
 
@@ -745,7 +769,9 @@ def needs_part_migration(scene: bpy.types.Scene) -> bool:
         if part_root_of(transform_owner(obj)) is not None:
             continue
         source = sketch_source_body(sketch)
-        if (source is not None and source != obj) or _has_solid_feature(obj):
+        if (source is not None and source != obj) or _has_solid_feature(
+            transform_owner(obj)
+        ):
             return True
     return False
 
@@ -785,7 +811,7 @@ def migrate_parts(scene: bpy.types.Scene) -> bool:
             changed = True
             continue
 
-        if _has_solid_feature(obj):
+        if _has_solid_feature(owner):
             promote_to_root(owner)
             changed = True
 
@@ -912,6 +938,17 @@ def _redirect_references(copy: bpy.types.Object, copies: dict) -> None:
     plane = copy.slvs_workplane
     if plane is not None and plane.name in copies:
         copy.slvs_workplane = copies[plane.name]
+
+    # A copied body must read the copied sketch, not the original's.
+    from .body import BODY_SKETCH_KEY, bind_body_to_sketch, is_body
+
+    source_sketch = copy.get(BODY_SKETCH_KEY)
+    if is_body(copy) and isinstance(source_sketch, bpy.types.Object):
+        if source_sketch.name in copies:
+            copied_sketch = copies[source_sketch.name]
+            copy[BODY_SKETCH_KEY] = copied_sketch
+            copied_sketch.slvs_body = copy
+            bind_body_to_sketch(copy, copied_sketch)
 
     source = copy.get(KEY_SOURCE)
     if isinstance(source, bpy.types.Object) and source.name in copies:
