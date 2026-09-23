@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 _FONT_ID = 0
 # Label height as a fraction of the origin plane's drawn side length.
 _LABEL_HEIGHT_FACTOR = 0.22
+# A plane that is not a base plane is a lesser thing to pick, so its name is
+# drawn smaller.
+_NAME_HEIGHT_FACTOR = 0.10
+# Space between those lines, as a fraction of one line's height.
+_LABEL_LINE_GAP = 0.2
 # Inset of the label from the plane's outer corner, as a fraction of its side.
 _LABEL_CORNER_MARGIN = 0.08
 
@@ -227,8 +232,10 @@ def draw_origin_labels():
     from .declarations import GizmoGroups
     from .drawing import selection
     from .utilities.workplane import (
-        ORIGIN_AXIS_COLOR,
+        is_base_plane,
         iter_wp_empties,
+        label_lines,
+        workplane_color,
         workplane_label,
         wp_plane_bounds,
     )
@@ -255,7 +262,11 @@ def draw_origin_labels():
 
         min_x, min_y, max_x, max_y = wp_plane_bounds(context, pick_id)
         side = max_x - min_x
-        target_h = side * _LABEL_HEIGHT_FACTOR
+        # Every label breaks the same way; only the size says how prominent the
+        # plane is, base planes being what you usually pick.
+        lines = label_lines(label)
+        base = is_base_plane(pick_id)
+        target_h = side * (_LABEL_HEIGHT_FACTOR if base else _NAME_HEIGHT_FACTOR)
 
         plane_mat = wp_obj.matrix_world
         up_world = plane_mat.to_3x3().col[1].normalized()
@@ -269,9 +280,13 @@ def draw_origin_labels():
             continue
         blf.size(_FONT_ID, max(8, min(round((s1 - s0).length), 256)))
 
-        w, h = blf.dimensions(_FONT_ID, label)
-        if h <= 0.0:
+        dims = [blf.dimensions(_FONT_ID, line) for line in lines]
+        line_h = max(h for _w, h in dims)
+        if line_h <= 0.0:
             continue
+        gap = line_h * _LABEL_LINE_GAP
+        w = max(_w for _w, _h in dims)
+        h = line_h * len(lines) + gap * (len(lines) - 1)
 
         # Anchor the text box's outer corner a margin in from the plane's outer
         # corner, so it reads as a corner label rather than filling the plane.
@@ -279,7 +294,7 @@ def draw_origin_labels():
 
         # Fit by width as well as height: a longer label (an origin plane says so)
         # would otherwise keep its glyph height and run off the plane's edge.
-        scale = target_h / h
+        scale = target_h / line_h
         usable = side - 2.0 * margin
         if w > 0.0 and w * scale > usable:
             scale = usable / w
@@ -303,18 +318,53 @@ def draw_origin_labels():
 
         # Axis-tinted, lightened toward white so the text reads a bit softer
         # than the plane fill, brighter still while hovered.
-        axis = ORIGIN_AXIS_COLOR[pick_id]
+        axis = workplane_color(pick_id)
         lift = 0.55 if selection.hover == pick_id else 0.35
         color = tuple(c + (1.0 - c) * lift for c in axis) + (1.0,)
         blf.color(_FONT_ID, *color)
 
         with gpu.matrix.push_pop():
             gpu.matrix.multiply_matrix(mat)
-            blf.position(_FONT_ID, 0.0, 0.0, 0.0)
-            blf.draw(_FONT_ID, label)
+            for i, (line, _dim) in enumerate(zip(lines, dims)):
+                # Stacked downwards from the top of the box, flush left: a
+                # centred second line reads as a separate label.
+                y = h - line_h - i * (line_h + gap)
+                blf.position(_FONT_ID, 0.0, y, 0.0)
+                blf.draw(_FONT_ID, line)
 
     gpu.state.depth_test_set("LESS_EQUAL")
     gpu.state.blend_set("NONE")
+
+
+def draw_axis_candidates():
+    """POST_VIEW: draw the axes a revolve can be picked around.
+
+    An axis is a base plane's own direction (see utilities.workplane), so these
+    are the frame of the part in focus, or the world's. Tinted like Blender's
+    own axes, since that is what they are; the one under the cursor is brighter.
+    """
+    if not global_data.axis_picker:
+        return
+
+    from .utilities.workplane import AXIS_COLOR, axis_endpoints, iter_axis_candidates
+
+    context = bpy.context
+    if context.region is None or context.region_data is None:
+        return
+
+    scale = preferences.get_scale()
+    for plane, index, pick_id in iter_axis_candidates(context):
+        start, end = axis_endpoints(plane, index, context)
+        hovered = global_data.hover_axis == pick_id
+        base = AXIS_COLOR[pick_id]
+        lift = 0.5 if hovered else 0.0
+        color = tuple(c + (1.0 - c) * lift for c in base) + (1.0,)
+        # Both ways from the origin: an axis is a line, not a ray, and the
+        # revolve does not care which end was clicked.
+        mirrored = start - (end - start)
+        _draw_lines_hover(
+            [mirrored[:], end[:]], color, scale, width=3 if hovered else 2
+        )
 
 
 # Viewport draw handlers, keyed by their global_data attribute. Order matches
@@ -324,6 +374,7 @@ _DRAW_HANDLERS = (
     ("draw_handle", draw_cb, "POST_VIEW"),
     ("hover_draw_handle", draw_hover_element, "POST_VIEW"),
     ("origin_label_draw_handle", draw_origin_labels, "POST_VIEW"),
+    ("axis_draw_handle", draw_axis_candidates, "POST_VIEW"),
     ("icon_draw_handle", None, "POST_PIXEL"),  # callback resolved in register()
 )
 

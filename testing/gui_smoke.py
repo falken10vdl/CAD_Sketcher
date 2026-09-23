@@ -74,6 +74,9 @@ def _view3d_context():
                         "area": area,
                         "region": region,
                         "space_data": area.spaces.active,
+                        # Screen-space picking (workplane and axis hit tests)
+                        # reads it; without it they find nothing at all.
+                        "region_data": area.spaces.active.region_3d,
                     }
     return None
 
@@ -95,6 +98,7 @@ def main():
     solver = importlib.import_module(f"{TARGET}.curve_solver")
     extrude_nodes = importlib.import_module(f"{TARGET}.utilities.extrude_nodes")
     part = importlib.import_module(f"{TARGET}.utilities.part")
+    body_mod = importlib.import_module(f"{TARGET}.utilities.body")
     sketch_ref = importlib.import_module(f"{TARGET}.model.sketch_ref")
     workplane = importlib.import_module(f"{TARGET}.utilities.workplane")
 
@@ -131,6 +135,52 @@ def main():
             _redraw()
             # Sketching on the part's own plane: the pick path a click takes.
             build_sketch_on_workplane(context, planes[0])
+            _redraw()
+
+        @_check("revolve axes drawn and picked")
+        def _():
+            from mathutils import Vector
+
+            workplane_mod = importlib.import_module(f"{TARGET}.utilities.workplane")
+            global_data = importlib.import_module(f"{TARGET}.global_data")
+            root = globals()["sketch_obj"]
+            ensure_part_planes(context, root)
+            root.select_set(True)
+            context.view_layer.objects.active = root
+
+            # What the Axis state switches on: the pass runs for real.
+            global_data.axis_picker = True
+            _redraw()
+            plane, index, pick_id = next(
+                iter(workplane_mod.iter_axis_candidates(context))
+            )
+            # What the hover gizmo publishes on a mouse-move over an axis: the
+            # cursor lands on the frame's origin, where all three cross.
+            from mathutils import Vector as _V
+
+            object_hover = importlib.import_module(f"{TARGET}.gizmos.object_hover")
+            from bpy_extras.view3d_utils import location_3d_to_region_2d
+
+            view = _view3d_context()
+            region = view["region"]
+            rv3d = view["space_data"].region_3d
+            start, _end = workplane_mod.axis_endpoints(plane, index, context)
+            on_screen = location_3d_to_region_2d(region, rv3d, start)
+            assert on_screen is not None, "the frame origin must be in view"
+            # The hover gizmo runs with a full view context (region included),
+            # which the steps here do not otherwise have.
+            with bpy.context.temp_override(**view):
+                hovered = object_hover.detect_axis_hover(
+                    bpy.context, _V(on_screen), None
+                )
+            assert hovered is not None, "an axis under the cursor must publish"
+            global_data.hover_axis = hovered
+            _redraw()
+            start, end = workplane_mod.axis_endpoints(plane, index, context)
+            assert (end - start).length > 0.0, "an axis needs a direction"
+            assert isinstance(start, Vector)
+            global_data.axis_picker = False
+            global_data.hover_axis = None
             _redraw()
 
         @_check("assembly created and drawn")
@@ -179,7 +229,10 @@ def main():
             )
             bpy.ops.view3d.slvs_node_extrude(target_name=body.name, offset=1.0)
             _redraw()
-            assert part.is_part_root(body), "a standalone solid must root a part"
+            # The part is rooted in the mesh the sketch is realised on.
+            base_body = body_mod.body_of(body)
+            assert base_body is not None, "a sketch must have a body"
+            assert part.is_part_root(base_body), "a standalone solid must root a part"
 
             # A second solid cutting it must become a feature of the first part
             # and hide itself. The target list is stubbed rather than detected:
@@ -198,16 +251,19 @@ def main():
                 f"{TARGET}.utilities.boolean_targets"
             )
             detect = boolean_targets.detect_targets
-            boolean_targets.detect_targets = lambda *a, **k: [body]
+            boolean_targets.detect_targets = lambda *a, **k: [base_body]
             try:
                 bpy.ops.view3d.slvs_node_extrude(target_name=cutter.name, offset=2.0)
             finally:
                 boolean_targets.detect_targets = detect
             _redraw()
-            assert part.part_root_of(cutter) == body, (
-                f"cutter joined {part.part_root_of(cutter)}, expected {body.name}"
+            assert part.part_root_of(cutter) == base_body, (
+                f"cutter joined {part.part_root_of(cutter)}, expected {base_body.name}"
             )
-            assert not cutter.visible_get(), "a cutter doing its job must be hidden"
+            cutter_body = body_mod.body_of(cutter)
+            assert not cutter_body.visible_get(), (
+                "a cutter doing its job must be hidden"
+            )
 
         @_check("sketch activated and drawn")
         def _():
