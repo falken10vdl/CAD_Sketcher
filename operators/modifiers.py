@@ -221,6 +221,25 @@ def _solver_for(body, cutter, solver=None):
     return "Exact"
 
 
+def select_result(context, cutter):
+    """Leave the thing the tool just made selected.
+
+    What that is depends on where the solid went: a cut joins the part it cuts,
+    and the part is what now shows the result, so that is what to hold on to. A
+    standalone solid is its own result. Never the cutter itself, which a cut
+    hides -- the user would be left holding something they cannot see.
+    """
+    from ..utilities.part import part_root_of
+
+    result = part_root_of(cutter) or cutter
+    if result.name not in context.view_layer.objects:
+        return
+    for obj in context.selected_objects:
+        obj.select_set(False)
+    result.select_set(True)
+    context.view_layer.objects.active = result
+
+
 class BooleanTargetItem(PropertyGroup):
     """One auto-detected boolean target, toggled in the extrude/revolve redo panel."""
 
@@ -345,13 +364,11 @@ class BooleanFromToolMixin:
         # is not a sketch's body is left alone: a part with its own history stays
         # a part.
         if sketch is not None:
-            from ..utilities.part import ensure_part_planes, settle_membership
+            from ..utilities.part import settle_membership
 
-            root = settle_membership(cutter, enabled_bodies)
-            if root is not None:
-                # A part that has just been born gets its base planes now, so
-                # they are there to sketch on rather than appearing later.
-                ensure_part_planes(context, root)
+            # Passing the context lets a part being born take its base planes
+            # here, which is what the joining body's own plane merges onto.
+            settle_membership(cutter, enabled_bodies, context)
 
         from ..utilities.part import update_cutter_display
 
@@ -362,6 +379,7 @@ class BooleanFromToolMixin:
         from ..utilities.collections import sync_part_collections
 
         sync_part_collections(context.scene)
+        select_result(context, cutter)
 
     def _apply_boolean_targets(self, cutter):
         """Apply this cutter's booleans. Returns the bodies it feeds, in order."""
@@ -1355,11 +1373,7 @@ class View3D_OT_node_boolean(Operator, NodeOperator):
 
         body = self.resolved_object()
         if body is not None and is_sketch_object(cutter):
-            from ..utilities.part import ensure_part_planes
-
-            root = settle_membership(cutter, [body.original])
-            if root is not None:
-                ensure_part_planes(context, root)
+            settle_membership(cutter, [body.original], context)
             sync_part_collections(context.scene)
 
     def set_props(self):
