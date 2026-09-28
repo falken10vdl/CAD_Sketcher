@@ -72,6 +72,7 @@ class Operators(str, Enum):
     Copy = "view3d.slvs_copy"
     DeleteConstraint = "view3d.slvs_delete_constraint"
     DeleteEntity = "view3d.slvs_delete_entity"
+    DeletePart = "view3d.slvs_delete_part"
     DeleteSketch = "view3d.slvs_delete_sketch"
     MergePoints = "view3d.slvs_merge_points"
     Paste = "view3d.slvs_paste"
