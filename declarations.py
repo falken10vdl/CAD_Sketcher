@@ -73,6 +73,8 @@ class Operators(str, Enum):
     DeleteConstraint = "view3d.slvs_delete_constraint"
     DeleteEntity = "view3d.slvs_delete_entity"
     DeleteAssembly = "view3d.slvs_delete_assembly"
+    DissolvePart = "view3d.slvs_dissolve_part"
+    RemoveFromPart = "view3d.slvs_remove_from_part"
     DeleteFeature = "view3d.slvs_delete_feature"
     DeletePart = "view3d.slvs_delete_part"
     DeleteSketch = "view3d.slvs_delete_sketch"
@@ -118,6 +120,7 @@ class Menus(str, Enum):
     AddSketch = "VIEW3D_MT_slvs_add_sketch"
     SketchWorkplane = "VIEW3D_MT_slvs_sketch_workplane"
     PartSketches = "VIEW3D_MT_slvs_part_sketches"
+    Part = "VIEW3D_MT_slvs_part"
 
 
 class Panels(str, Enum):
