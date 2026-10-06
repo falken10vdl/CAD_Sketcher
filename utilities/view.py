@@ -455,8 +455,17 @@ def curve_segment_under_cursor(context: Context, coords, threshold_px):
     cx, cy = float(coords[0]), float(coords[1])
     thr2 = threshold_px * threshold_px
     best = None
-    for ob in context.visible_objects:
+    # Not ``context.visible_objects``: a sketch's curves are a hidden object that
+    # the add-on draws itself, so Blender says no to every one of them. The
+    # shared rule asks what is actually on screen (see ``is_reference_source``).
+    from ..drawing.reference_pick import is_reference_source
+    from ..model.sketch_ref import get_active_sketch
+
+    active = get_active_sketch(context)
+    for ob in context.view_layer.objects:
         if ob.type not in {"CURVE", "CURVES"}:
+            continue
+        if not is_reference_source(ob, context, active):
             continue
         cd = getattr(ob.original, "data", None)
         if (
@@ -541,7 +550,7 @@ def get_blender_snap_info(context: Context, coords: Vector) -> Optional[dict]:
         # mode, which would otherwise force the expensive all-geometry scan on
         # every frame.
         if not hit or hit_ob is None:
-            return None
+            break
         # Skip the sketch being drawn in (#591) and any hidden object -- ray_cast
         # hits geometry regardless of viewport visibility, so without this you
         # could snap to an invisible mesh. Advance past and keep looking behind.
@@ -549,26 +558,19 @@ def get_blender_snap_info(context: Context, coords: Vector) -> Optional[dict]:
             ob, face_index = hit_ob, hit_face
             break
         ray_origin = Vector(location) + view_vector * 1e-4
-    else:
-        return None
 
-    if ob.type == "MESH":
-        # Restrict to the hit face's vertices/edges for a cheap, local search.
-        candidates = _screen_snap_candidates(
-            context,
-            coords,
-            ob.evaluated_get(depsgraph),
-            elements,
-            face_index=face_index,
+    candidates = []
+    if ob is not None:
+        candidates += _raycast_candidates(
+            context, ob, coords, elements, face_index, depsgraph
         )
-    elif ob.type == "CURVES":
-        # CAD Sketcher sketches (and other curve objects) are Curves objects; the
-        # generated mesh can't be read back, but their control points can, so
-        # snap to the curve's points and segments directly.
-        candidates = _curve_snap_candidates(context, ob.original, coords, elements)
-    else:
-        return None
+    # A sketch's curves have no geometry for the ray to hit, so the scan above
+    # can never reach one; they are gathered in screen space instead. Only the
+    # sketches that are actually on screen (see ``is_reference_source``), which
+    # in practice is the coplanar handful, so a mouse-move stays cheap.
+    candidates += _sketch_snap_candidates(context, coords, elements, skipped)
 
+    candidates = _best_per_position(candidates)
     if not candidates:
         return None
 
@@ -577,6 +579,94 @@ def get_blender_snap_info(context: Context, coords: Vector) -> Optional[dict]:
     )
     snap_data["region_point"] = region_point
     return snap_data
+
+
+def _best_per_position(candidates):
+    """One candidate per world position: the most specific, then the nearest.
+
+    A sketch stores a line's endpoints both as point curves and as the line's own
+    control points, so one place under the cursor offers several candidates at
+    distance zero. Which of them ``min`` returned was decided by list order, and
+    a vertex and an edge at the same spot link differently (a coincidence pins
+    the point, point-on-line lets it slide), so the endpoint appeared to jump
+    between the two. Keeping the best per position makes the choice stable.
+    """
+    best = {}
+    for candidate in candidates:
+        priority, distance, _region_point, data = candidate
+        world = data.get("world_point")
+        if world is None:
+            key = id(data)
+        else:
+            key = (round(world[0], 6), round(world[1], 6), round(world[2], 6))
+        current = best.get(key)
+        if current is None or (priority, distance) < (current[0], current[1]):
+            best[key] = candidate
+    return list(best.values())
+
+
+def _raycast_candidates(context, ob, coords, elements, face_index, depsgraph):
+    """Snap candidates from the object the ray actually hit."""
+    if ob.type == "MESH":
+        # Restrict to the hit face's vertices/edges for a cheap, local search.
+        return _screen_snap_candidates(
+            context,
+            coords,
+            ob.evaluated_get(depsgraph),
+            elements,
+            face_index=face_index,
+        )
+    if ob.type == "CURVES":
+        # The generated mesh can't be read back, but the control points can, so
+        # snap to the curve's points and segments directly.
+        return _curve_snap_candidates(context, ob.original, coords, elements)
+    return []
+
+
+def _near_in_screen(context, ob, coords, margin) -> bool:
+    """Whether ``ob``'s screen-space bounds come within ``margin`` of the cursor.
+
+    Eight projected corners, to decide whether the per-point scan is worth doing
+    at all. Without it a cursor over empty space pays for every sketch's points
+    on every mouse move, which is the cost the ray-cast early-out used to avoid.
+    Bounds that do not project (entirely behind the view) keep the object, since
+    a wrong skip would silently lose a snap.
+    """
+    region, rv3d = context.region, context.region_data
+    if region is None or rv3d is None:
+        return True
+    matrix = ob.matrix_world
+    xs, ys = [], []
+    for corner in ob.bound_box:
+        point = location_3d_to_region_2d(region, rv3d, matrix @ Vector(corner))
+        if point is not None:
+            xs.append(point.x)
+            ys.append(point.y)
+    if not xs:
+        return True
+    return (
+        min(xs) - margin <= coords[0] <= max(xs) + margin
+        and min(ys) - margin <= coords[1] <= max(ys) + margin
+    )
+
+
+def _sketch_snap_candidates(context, coords, elements, skipped):
+    """Snap candidates from the sketches on screen, which the ray cannot hit."""
+    from ..drawing.reference_pick import is_reference_source
+    from ..model.sketch_ref import get_active_sketch, is_sketch_object
+
+    active = get_active_sketch(context)
+    margin = _snap_screen_threshold(context)
+    found = []
+    for ob in context.view_layer.objects:
+        if not is_sketch_object(ob) or ob.original in skipped:
+            continue
+        if not is_reference_source(ob, context, active):
+            continue
+        if not _near_in_screen(context, ob, coords, margin):
+            continue
+        found += _curve_snap_candidates(context, ob.original, coords, elements)
+    return found
 
 
 def get_pos_2d(
