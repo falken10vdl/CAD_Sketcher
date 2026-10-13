@@ -126,10 +126,13 @@ def mark_group_root(
     free_transform(obj)
     if provisional:
         obj[PROVISIONAL_KEY] = True
-        return
-    if PROVISIONAL_KEY in obj:
+    elif PROVISIONAL_KEY in obj:
         del obj[PROVISIONAL_KEY]
     if kind == PART:
+        # Named from the first stroke, provisional or not. The plane a sketch is
+        # drawn on IS the part's XY; withholding the name only meant renaming it
+        # out from under the user later. What a provisional part still withholds
+        # is *offering* its planes (see is_provisional_part).
         promote_sketch_plane(obj)
 
 
@@ -181,9 +184,9 @@ def is_provisional_part(root: Optional[bpy.types.Object]) -> bool:
 def realise_part(root: bpy.types.Object) -> bool:
     """Make a provisional part a part in full. True if that changed anything.
 
-    What it has been waiting for: the plane its sketch was drawn on becomes the
-    part's XY, and from here it groups, offers its frame, and reads as a part
-    everywhere. One way: a part that loses its feature again stays a part.
+    What it has been waiting for: from here it groups, offers its frame and
+    reads as a part everywhere. Its XY is already named (see mark_group_root).
+    One way: a part that loses its feature again stays a part.
     """
     if not is_provisional_part(root):
         return False
@@ -532,6 +535,10 @@ def merge_coincident_plane(root: bpy.types.Object, body: bpy.types.Object) -> No
     whose base plane stands in the very same place leaves two rectangles on top
     of each other. Its sketches move onto the part's plane, which is where they
     already were, and the spare empty goes.
+
+    The body's own plane is the one standing in its frame, stamped as its XY or
+    not: a body that joins a part stops being a root, so the stamp it carried
+    says nothing any more.
     """
     from .workplane import is_managed_workplane
 
@@ -539,7 +546,7 @@ def merge_coincident_plane(root: bpy.types.Object, body: bpy.types.Object) -> No
         (
             child
             for child in body.children
-            if is_managed_workplane(child) and PART_PLANE_KEY not in child
+            if is_managed_workplane(child) and child.matrix_basis == Matrix.Identity(4)
         ),
         None,
     )
@@ -882,13 +889,14 @@ def ensure_part_planes(context, root: bpy.types.Object) -> list:
 def part_plane_objects(context) -> list:
     """The base planes of the part in focus, or an empty list if there is none.
 
-    These stand in for the scene's origin planes while a part is in focus, so a
-    part that is still only a sketch offers none: its frame is the plane that
-    sketch was drawn on, and taking the world's planes away before there is a
-    body to work against would leave nowhere to start the next one.
+    These stand in for the scene's origin planes while a part is in focus. A
+    provisional part has just the one, the XY its first sketch was drawn on,
+    which is what you pick to put a second sketch on that same plane. Its XZ and
+    YZ are not minted until the part is real, so a fresh sketch offers one
+    rectangle rather than three.
     """
     root = focused_part(context)
-    if root is None or is_provisional_part(root):
+    if root is None:
         return []
     return [
         plane
