@@ -3,6 +3,7 @@ from typing import Any, List
 import bpy
 from bpy.props import StringProperty
 from bpy.types import Context, Event
+from mathutils import Vector
 
 from ..model.curve_ref import CurveRef, PointRef, curve_ref
 from ..model.types import SlvsPoint2D
@@ -519,6 +520,119 @@ class Operator2d(GenericEntityOp):
         if cid:
             return PointRef(sketch, cid)
         return getattr(self, state.pointer)
+
+    def state_value_origin(self, context: Context):
+        """The point this state is placed relative to, in sketch coordinates."""
+        return self._placed_point_co(context, self.state_index - 1)
+
+    # Which aligned distance measures a component of a placed point. A sketch's
+    # third axis has no aligned distance, so a Z typed into a 3D sketch places
+    # the point without being kept as a dimension.
+    _COMPONENT_ALIGNMENT = ("HORIZONTAL", "VERTICAL")
+
+    def _run_fini(self, context: Context, succeede: bool) -> None:
+        super()._run_fini(context, succeede)
+        if succeede:
+            self._add_typed_dimensions(context)
+
+    def _add_typed_dimensions(self, context: Context) -> None:
+        """Keep every number typed into a value box as a driving dimension.
+
+        Typing a width states what the width *is*, so it outlives the click:
+        the pair of points it was typed between gets an aligned distance
+        holding them that far apart, and solving the sketch keeps it. A value
+        only dragged states nothing and leaves the points free.
+        """
+        sketch = self.sketch
+        if sketch is None:
+            return
+
+        for index in range(len(self.get_states())):
+            typed = self.get_state_data(index).get("numeric_input") or ()
+            if not any(number is not None for number in typed):
+                continue
+            end = self.get_state_data(index).get("curve_id", "")
+            start = self.get_state_data(index - 1).get("curve_id", "") if index else ""
+            if not end or not start:
+                continue
+            origin = self._placed_point_co(context, index - 1)
+            placed = self._placed_point_co(context, index)
+            if origin is None or placed is None:
+                continue
+
+            for axis, number in enumerate(typed):
+                if number is None or axis >= len(self._COMPONENT_ALIGNMENT):
+                    continue
+                sketch.constraints.add_distance(
+                    init=True,
+                    curve_id_1=start,
+                    curve_id_2=end,
+                    align=self._COMPONENT_ALIGNMENT[axis],
+                    value=abs(placed[axis] - origin[axis]),
+                )
+
+    def state_value_spans(self, context: Context, values, count: int):
+        """The stretch each of this state's value boxes measures, in world space.
+
+        One box spans what is being drawn: the segment from the last point to
+        the one being placed. Several boxes are one per axis, and each spans the
+        leg its component covers, so a rectangle's width is dimensioned along
+        its horizontal edge and its height along the vertical one, the way a CAD
+        sketcher shows them.
+        """
+        sketch = self.sketch
+        if sketch is None or getattr(sketch, "target_object", None) is None:
+            return []
+
+        start = self._placed_point_co(context, self.state_index - 1)
+        end = self._live_point_co(values)
+        if end is None and start is None:
+            return []
+
+        to_world = sketch.world_matrix
+
+        if start is None or end is None:
+            # A lone point, or a number with no second point to measure to:
+            # there is no stretch, so every box sits on the one place there is.
+            point = to_world @ (start if start is not None else end)
+            return [(point, point)] * count
+
+        if count < 2:
+            return [(to_world @ start, to_world @ end)]
+
+        # Walk from start to end one axis at a time; each leg is the stretch
+        # that component measures.
+        spans = []
+        corner = start.copy()
+        for axis in range(min(count, len(start))):
+            moved = corner.copy()
+            moved[axis] = end[axis]
+            spans.append((to_world @ corner, to_world @ moved))
+            corner = moved
+        return spans
+
+    @staticmethod
+    def _live_point_co(values):
+        """This state's value as a sketch-local point, if it is one."""
+        for value in values or ():
+            if hasattr(value, "__len__") and len(value) in (2, 3):
+                return Vector(value).to_3d()
+        return None
+
+    def _placed_point_co(self, context: Context, index: int):
+        """An earlier state's point, sketch-local, or None when it has none."""
+        if index < 0 or index not in self._state_data:
+            return None
+        try:
+            ref = self.get_point(context, index)
+        except Exception:
+            # A state holds whatever its pick produced; it may be no point.
+            return None
+        is_point = getattr(ref, "is_point", None)
+        if not callable(is_point) or not is_point():
+            return None
+        co = getattr(ref, "co", None)
+        return Vector(co).to_3d() if co is not None and len(co) >= 2 else None
 
 
 class ReplaceableOutputOp:

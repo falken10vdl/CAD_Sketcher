@@ -16,6 +16,16 @@ hover_element = None
 # hover gizmo detects/highlights what this state will actually pick.
 hover_types = None
 
+# The value(s) the running stateful operator is resolving, to show by the
+# geometry they belong to:
+#   (boxes, region pointer) | None,  boxes = ((text, start, end, focused), ...)
+# ``start`` and ``end`` are the ends of the stretch the value measures, already
+# in region pixels, so the draw handler can dimension it.
+# One box while the value is only being dragged, one per component once it is
+# being typed into. The region pointer pins them to the view the mouse is in, so
+# they aren't drawn at the same spot in every other 3D view of the screen.
+state_value = None
+
 # NOTE: interactive selection/hover/highlight state lives in
 # ``drawing.selection`` (transient, never persisted to the datablock).
 
@@ -47,6 +57,7 @@ hover_draw_handle = None
 icon_draw_handle = None
 origin_label_draw_handle = None
 axis_draw_handle = None
+state_value_draw_handle = None
 
 COPY_BUFFER = {}
 
