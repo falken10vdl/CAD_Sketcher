@@ -1236,13 +1236,13 @@ def _redirect_references(copy: bpy.types.Object, copies: dict) -> None:
         copy.slvs_workplane = copies[plane.name]
 
     # A copied body must read the copied sketch, not the original's.
-    from .body import BODY_SKETCH_KEY, bind_body_to_sketch, is_body
+    from .body import BODY_SKETCH_KEY, bind_body_to_sketch, is_body, set_body_sketch
 
     source_sketch = copy.get(BODY_SKETCH_KEY)
     if is_body(copy) and isinstance(source_sketch, bpy.types.Object):
         if source_sketch.name in copies:
             copied_sketch = copies[source_sketch.name]
-            copy[BODY_SKETCH_KEY] = copied_sketch
+            set_body_sketch(copy, copied_sketch)
             copied_sketch.slvs_body = copy
             bind_body_to_sketch(copy, copied_sketch)
 

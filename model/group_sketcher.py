@@ -299,11 +299,15 @@ def register():
     # The Object whose frame a sketch's local coordinates live in. Explicit, so a
     # sketch's plane is independent of whatever parents (places) the sketch.
     bpy.types.Object.slvs_workplane = PointerProperty(
-        type=bpy.types.Object, name="Workplane Object"
+        type=bpy.types.Object,
+        name="Workplane Object",
+        override={"LIBRARY_OVERRIDABLE"},
     )
     # The mesh a sketch's geometry is realised on (see utilities.body).
     bpy.types.Object.slvs_body = PointerProperty(
-        type=bpy.types.Object, name="Body Object"
+        type=bpy.types.Object,
+        name="Body Object",
+        override={"LIBRARY_OVERRIDABLE"},
     )
     bpy.types.Scene.sketcher = PointerProperty(type=SketcherProps)
 
