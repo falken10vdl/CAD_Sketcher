@@ -305,11 +305,11 @@ def _redirect_to_body(scene, sketch_obj: bpy.types.Object, body: bpy.types.Objec
         set_modifier_input,
     )
     from .boolean_nodes import BOOLEAN_NODE_GROUP
-    from .face_anchor import KEY_SOURCE
+    from .face_anchor import KEY_SOURCE, set_wp_source
 
     for obj in scene.objects:
         if obj.get(KEY_SOURCE) == sketch_obj:
-            obj[KEY_SOURCE] = body
+            set_wp_source(obj, body)
         for modifier in obj.modifiers:
             group = getattr(modifier, "node_group", None)
             if modifier.type != "NODES" or group is None:

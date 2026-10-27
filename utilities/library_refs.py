@@ -1,9 +1,10 @@
-"""Libraries saved before a body's sketch link could survive a library override.
+"""Libraries saved before an object link could survive a library override.
 
-A body's ``slvs:body_of`` link is kept on an override only when the body, in the
-file that owns it, has the property flagged overridable. A library saved without
-that flag makes every override of its bodies fall back to the linked sketch
-after the file is saved and reopened.
+A body's ``slvs:body_of`` link and a face workplane's ``slvs_wp_source`` link are
+kept on an override only when the object, in the file that owns it, has the
+property flagged overridable. A library saved without that flag makes every
+override of such an object fall back to the linked object after the file is
+saved and reopened.
 
 Nothing here edits a file other than the one that is open: a main file reports
 which libraries are outdated, and the repair runs in the library file itself.
@@ -15,13 +16,28 @@ from typing import List
 import bpy
 
 from .body import BODY_SKETCH_PATH, is_body
+from .face_anchor import KEY_SOURCE, WP_SOURCE_PATH
 
 
 def body_link_is_overridable(body: bpy.types.Object) -> bool:
+    return _path_is_overridable(body, BODY_SKETCH_PATH)
+
+
+def _path_is_overridable(obj: bpy.types.Object, path: str) -> bool:
     try:
-        return bool(body.is_property_overridable_library(BODY_SKETCH_PATH))
+        return bool(obj.is_property_overridable_library(path))
     except (TypeError, RuntimeError):
         return True
+
+
+def unflagged_links(obj: bpy.types.Object) -> List[str]:
+    """Paths of the object links ``obj`` stores that a library override would drop."""
+    links = []
+    if is_body(obj):
+        links.append(BODY_SKETCH_PATH)
+    if isinstance(obj.get(KEY_SOURCE), bpy.types.Object):
+        links.append(WP_SOURCE_PATH)
+    return [path for path in links if not _path_is_overridable(obj, path)]
 
 
 def outdated_libraries() -> List[bpy.types.Library]:
@@ -38,22 +54,19 @@ def outdated_libraries() -> List[bpy.types.Library]:
     }
     found = {}
     for obj in overridden:
-        if obj.library is None or not is_body(obj):
+        if obj.library is None:
             continue
-        if not body_link_is_overridable(obj):
+        if unflagged_links(obj):
             found[obj.library.as_pointer()] = obj.library
     return sorted(found.values(), key=lambda lib: lib.filepath)
 
 
 def outdated_body_objects() -> List[bpy.types.Object]:
-    """This file's own bodies that lack the link flag: what a repair would touch."""
+    """This file's own objects that lack a link flag: what a repair would touch."""
     return [
         obj
         for obj in bpy.data.objects
-        if obj.library is None
-        and obj.override_library is None
-        and is_body(obj)
-        and not body_link_is_overridable(obj)
+        if obj.library is None and obj.override_library is None and unflagged_links(obj)
     ]
 
 
@@ -70,11 +83,12 @@ def repair_blocker() -> str:
 
 
 def repair_bodies() -> int:
-    """Flag this file's own bodies. Returns how many changed. Touches nothing else."""
-    bodies = outdated_body_objects()
-    for body in bodies:
-        body.property_overridable_library_set(BODY_SKETCH_PATH, True)
-    return len(bodies)
+    """Flag this file's own objects. Returns how many changed. Touches nothing else."""
+    objects = outdated_body_objects()
+    for obj in objects:
+        for path in unflagged_links(obj):
+            obj.property_overridable_library_set(path, True)
+    return len(objects)
 
 
 def library_label(library: bpy.types.Library) -> str:

@@ -1229,7 +1229,7 @@ def _redirect_references(copy: bpy.types.Object, copies: dict) -> None:
         set_modifier_input,
     )
     from .boolean_nodes import BOOLEAN_NODE_GROUP
-    from .face_anchor import KEY_SOURCE
+    from .face_anchor import KEY_SOURCE, set_wp_source
 
     plane = copy.slvs_workplane
     if plane is not None and plane.name in copies:
@@ -1248,7 +1248,7 @@ def _redirect_references(copy: bpy.types.Object, copies: dict) -> None:
 
     source = copy.get(KEY_SOURCE)
     if isinstance(source, bpy.types.Object) and source.name in copies:
-        copy[KEY_SOURCE] = copies[source.name]
+        set_wp_source(copy, copies[source.name])
 
     for modifier in copy.modifiers:
         group = getattr(modifier, "node_group", None)

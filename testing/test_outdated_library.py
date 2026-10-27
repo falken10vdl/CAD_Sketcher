@@ -7,16 +7,18 @@ import os
 import tempfile
 from unittest import mock
 
+import bmesh
 import bpy
 
 from ..base import outdated_library
 from ..model.curve_ref import LineRef, PointRef
 from ..operators import repair_library
-from ..operators.add_sketch import build_sketch_on_workplane
+from ..operators.add_sketch import build_sketch_on_workplane, create_face_workplane
 from ..ui.panels import sketch_select
 from ..utilities import library_refs
 from ..utilities.body import BODY_SKETCH_PATH, body_of, ensure_body
 from ..utilities.curve_data import refresh_curve_geometry
+from ..utilities.face_anchor import WP_SOURCE_PATH
 from ..utilities.workplane import ensure_origin_workplane_empties
 from .test_override_reference_persistence import _run
 from .utils import BgsTestCase
@@ -46,6 +48,17 @@ class OutdatedLibraryCase(BgsTestCase):
         refresh_curve_geometry(sketch)
         obj = sketch.target_object
         self.body = body_of(obj) or ensure_body(self.context, obj, "Body")
+
+    def face_workplane(self):
+        mesh = bpy.data.meshes.new("plate")
+        bm = bmesh.new()
+        bmesh.ops.create_cube(bm, size=2.0)
+        bm.to_mesh(mesh)
+        bm.free()
+        plate = bpy.data.objects.new("plate", mesh)
+        self.context.scene.collection.objects.link(plate)
+        top = next(p.index for p in mesh.polygons if p.normal.z > 0.9)
+        return create_face_workplane(self.context, plate, top)
 
     def linked_part(self, outdated, override=True):
         """The body of a part linked from a library file, and its override."""
@@ -82,6 +95,16 @@ class TestDetection(OutdatedLibraryCase):
         self.body.property_overridable_library_set(BODY_SKETCH_PATH, False)
         self.assertEqual(library_refs.outdated_body_objects(), [self.body])
 
+    def test_a_face_workplane_made_now_is_flagged(self):
+        plane = self.face_workplane()
+        self.assertTrue(plane.is_property_overridable_library(WP_SOURCE_PATH))
+        self.assertEqual(library_refs.outdated_body_objects(), [])
+
+    def test_a_face_workplane_without_the_flag_is_outdated(self):
+        plane = self.face_workplane()
+        plane.property_overridable_library_set(WP_SOURCE_PATH, False)
+        self.assertEqual(library_refs.outdated_body_objects(), [plane])
+
     def test_an_overridden_old_library_is_outdated(self):
         linked, _ = self.linked_part(outdated=True)
         self.assertEqual(library_refs.outdated_libraries(), [linked.library])
@@ -106,6 +129,12 @@ class TestRepairLibrary(OutdatedLibraryCase):
         bpy.ops.view3d.slvs_repair_library()
         self.assertTrue(flagged(self.body))
         self.assertFalse(bpy.ops.view3d.slvs_repair_library.poll())
+
+    def test_repair_flags_the_files_own_face_workplanes(self):
+        plane = self.face_workplane()
+        plane.property_overridable_library_set(WP_SOURCE_PATH, False)
+        bpy.ops.view3d.slvs_repair_library()
+        self.assertTrue(plane.is_property_overridable_library(WP_SOURCE_PATH))
 
     def test_nothing_to_repair_is_not_offered(self):
         self.assertFalse(bpy.ops.view3d.slvs_repair_library.poll())

@@ -4,7 +4,8 @@
 where ``<step>`` is one of:
 
 - ``library <package> <path> [old]``: write a library holding one part. With
-  ``old`` the body's sketch link is left unflagged, as older versions saved it.
+  ``old`` the object links are left unflagged, as older versions saved them. The
+  sketch is drawn on a face of a second object, which it also projects from.
 - ``override <package> <library> <main>``: link the library, override the part
   and save the result.
 - ``report <package> <main>``: open the file and print one ``RESULT`` line of
@@ -16,8 +17,8 @@ import json
 import sys
 
 import addon_utils
+import bmesh
 import bpy
-from mathutils import Matrix
 
 
 def _module(package, name):
@@ -39,17 +40,29 @@ def make_library(package, path, old):
     add_sketch = _module(package, "operators.add_sketch")
     curve_ref = _module(package, "model.curve_ref")
 
+    face_anchor = _module(package, "utilities.face_anchor")
+
     scene.sketcher.entities.ensure_origin_elements(context)
-    plane = add_sketch.new_workplane_empty(context, Matrix.Identity(4))
+    mesh = bpy.data.meshes.new("plate")
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=2.0)
+    bm.to_mesh(mesh)
+    bm.free()
+    plate = bpy.data.objects.new("plate", mesh)
+    scene.collection.objects.link(plate)
+    top = next(p.index for p in mesh.polygons if p.normal.z > 0.9)
+    plane = add_sketch.create_face_workplane(context, plate, top)
     sketch = add_sketch.build_sketch_on_workplane(context, plane)
     start = curve_ref.PointRef.create(sketch, (0, 0), fixed=True)
     end = curve_ref.PointRef.create(sketch, (1, 0))
     curve_ref.LineRef.create(sketch, start, end)
     sketch_obj = sketch.target_object
+    sketch_obj.slvs_project_sources.add().source = plate
     body = body_mod.body_of(sketch_obj)
     if old:
-        body.property_overridable_library_set(f'["{body_mod.BODY_SKETCH_KEY}"]', False)
-    bpy.data.libraries.write(path, {sketch_obj, plane, body}, fake_user=True)
+        body.property_overridable_library_set(body_mod.BODY_SKETCH_PATH, False)
+        plane.property_overridable_library_set(face_anchor.WP_SOURCE_PATH, False)
+    bpy.data.libraries.write(path, {sketch_obj, plane, body, plate}, fake_user=True)
 
 
 def make_override(package, library, main):
@@ -68,6 +81,7 @@ def make_override(package, library, main):
 
 def report(package, main):
     body_mod = _module(package, "utilities.body")
+    face_anchor = _module(package, "utilities.face_anchor")
     bpy.ops.wm.open_mainfile(filepath=main)
     result = {}
     for obj in bpy.data.objects:
@@ -79,6 +93,10 @@ def report(package, main):
         }
         if body_mod.is_body(obj):
             entry["body_of"] = _kind(obj.get(body_mod.BODY_SKETCH_KEY))
+        if face_anchor.KEY_SOURCE in obj:
+            entry["wp_source"] = _kind(obj[face_anchor.KEY_SOURCE])
+        if len(obj.slvs_project_sources):
+            entry["project_source"] = _kind(obj.slvs_project_sources[0].source)
         result[obj.name] = entry
     print("RESULT " + json.dumps(result))
 

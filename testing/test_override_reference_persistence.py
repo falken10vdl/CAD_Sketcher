@@ -70,3 +70,16 @@ class TestOverrideReferencesSurviveReload(TestCase):
 
     def test_a_library_saved_without_the_flag_loses_the_body_link(self):
         self.assertEqual(self.body(self.reloaded("old"))["body_of"], "linked")
+
+    def workplane_empty(self, result):
+        return next(e for e in result.values() if "wp_source" in e)
+
+    def test_a_face_workplane_keeps_the_object_it_was_drawn_on(self):
+        self.assertEqual(self.workplane_empty(self.reloaded())["wp_source"], "override")
+
+    def test_a_sketch_keeps_the_object_it_projects_from(self):
+        self.assertEqual(self.sketch(self.reloaded())["project_source"], "override")
+
+    def test_a_library_saved_without_the_flag_loses_the_workplane_source(self):
+        result = self.reloaded("old")
+        self.assertEqual(self.workplane_empty(result)["wp_source"], "linked")
