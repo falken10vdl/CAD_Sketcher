@@ -136,6 +136,15 @@ class TestRepairLibrary(OutdatedLibraryCase):
         bpy.ops.view3d.slvs_repair_library()
         self.assertTrue(plane.is_property_overridable_library(WP_SOURCE_PATH))
 
+    def test_the_report_counts_what_was_repaired(self):
+        self.assertEqual(
+            repair_library.repaired_message(1), "Repaired 1 object. Save this file now."
+        )
+        self.assertEqual(
+            repair_library.repaired_message(3),
+            "Repaired 3 objects. Save this file now.",
+        )
+
     def test_nothing_to_repair_is_not_offered(self):
         self.assertFalse(bpy.ops.view3d.slvs_repair_library.poll())
 

@@ -11,6 +11,11 @@ from ..utilities.library_refs import (
 )
 
 
+def repaired_message(count: int) -> str:
+    noun = "object" if count == 1 else "objects"
+    return f"Repaired {count} {noun}. Save this file now."
+
+
 class View3D_OT_slvs_repair_library(Operator):
     """Mark this file's bodies so overrides of them keep their sketch links
 
@@ -32,7 +37,7 @@ class View3D_OT_slvs_repair_library(Operator):
             self.report({"WARNING"}, blocker)
             return {"CANCELLED"}
         count = repair_bodies()
-        self.report({"INFO"}, f"Repaired {count} body/bodies. Save this file now.")
+        self.report({"INFO"}, repaired_message(count))
         return {"FINISHED"}
 
 
