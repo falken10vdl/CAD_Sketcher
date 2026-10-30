@@ -255,6 +255,37 @@ def _draw_broken_body_prompt(context: Context, layout: UILayout):
     )
 
 
+def _draw_outdated_library_prompt(context: Context, layout: UILayout):
+    """Report a library that cannot keep overrides of its bodies linked, and
+    offer the repair where it is safe: in the library file itself.
+
+    A file that only links the library cannot repair it, so it is told what to
+    do instead. The checks run only while this panel is drawn."""
+    from ...utilities.library_refs import (
+        outdated_body_objects,
+        outdated_libraries,
+        warning_lines,
+    )
+
+    libraries = outdated_libraries()
+    if libraries:
+        box = layout.box()
+        box.alert = True
+        box.label(text="Linked library is outdated", icon="ERROR")
+        for line in warning_lines(libraries):
+            box.label(text=line)
+        return
+
+    if outdated_body_objects():
+        box = layout.box()
+        box.label(text="Bodies are not ready to be linked", icon="INFO")
+        box.operator(
+            declarations.Operators.RepairLibrary,
+            text="Repair Library File",
+            icon="FILE_REFRESH",
+        )
+
+
 def sketch_selector(
     context: Context,
     layout: UILayout,
@@ -301,6 +332,7 @@ class VIEW3D_PT_sketcher(VIEW3D_PT_sketcher_base):
 
         _draw_migration_prompt(context, layout)
         _draw_broken_body_prompt(context, layout)
+        _draw_outdated_library_prompt(context, layout)
         sketch_selector(context, layout)
         sketch = get_active_sketch(context)
         layout.use_property_split = True

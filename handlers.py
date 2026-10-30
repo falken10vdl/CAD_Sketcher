@@ -86,6 +86,10 @@ def on_load_post(*args):
     constraint_icons.invalidate()
     selection.clear()
 
+    from .base.outdated_library import schedule_warning
+
+    schedule_warning()
+
     # A file with no path was never saved, so it is this session's and current by
     # definition. Any version its scenes carry came from the startup file, which
     # a user saves once and keeps: without this, every File > New from a startup
