@@ -38,6 +38,27 @@ class TestConstraintTypeGuard(Sketch2dTestCase):
             sc.add_coincident(
                 curve_id_1=self.line.curve_id, curve_id_2=self.circle.curve_id
             ),
+            sc.add_distance(
+                curve_id_1=self.p0.curve_id, curve_id_2=self.p0.curve_id
+            ),
+            sc.add_distance(
+                curve_id_1=self.p0.curve_id, curve_id_2=self.line.curve_id
+            ),
+            sc.add_distance(
+                curve_id_1=self.p1.curve_id, curve_id_2=self.line.curve_id
+            ),
+            sc.add_distance(
+                curve_id_1=self.line.curve_id, curve_id_2=self.p0.curve_id
+            ),
+            sc.add_distance(
+                curve_id_1=self.line.curve_id, curve_id_2=self.p1.curve_id
+            ),
+            sc.add_distance(
+                curve_id_1=self.circle.curve_id, curve_id_2=self.circle.ct.curve_id
+            ),
+            sc.add_distance(
+                curve_id_1=self.circle.ct.curve_id, curve_id_2=self.circle.curve_id
+            ),
         ]
         self._solve()
         for c in bad:
@@ -55,6 +76,22 @@ class TestConstraintTypeGuard(Sketch2dTestCase):
         dist = abs(d.x * (ct.y - a.y) - d.y * (ct.x - a.x)) / d.length
         self.assertAlmostEqual(dist, self.circle.radius, places=4)
 
+    def test_distance_curve_second_matches_curve_first(self):
+        sc = self.sketch.constraints
+        d = sc.add_distance(
+            curve_id_1=self.p2.curve_id, curve_id_2=self.circle.curve_id, value=1.0
+        )
+        self.assertTrue(self._solve())
+        self.assertFalse(d.failed)
+
+    def test_distance_line_and_circle_either_order(self):
+        sc = self.sketch.constraints
+        d = sc.add_distance(
+            curve_id_1=self.line2.curve_id, curve_id_2=self.circle.curve_id, value=1.0
+        )
+        self.assertTrue(self._solve())
+        self.assertFalse(d.failed)
+
     def test_supported_pairs_unchanged(self):
         sc = self.sketch.constraints
         ok = [
@@ -66,6 +103,9 @@ class TestConstraintTypeGuard(Sketch2dTestCase):
             ),
             sc.add_coincident(
                 curve_id_1=self.p0.curve_id, curve_id_2=self.line2.curve_id
+            ),
+            sc.add_distance(
+                curve_id_1=self.p2.curve_id, curve_id_2=self.line.curve_id, value=3.0
             ),
         ]
         self.assertTrue(self._solve())

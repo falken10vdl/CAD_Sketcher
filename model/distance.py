@@ -130,6 +130,64 @@ class SlvsDistance(DimensionalConstraint, PropertyGroup):
         first, second = self.signature
         return (first, (*second, SlvsCircle, SlvsArc))
 
+    def accepts_curve_types(self, sketch):
+        """Whether the referenced curves have types this constraint can solve."""
+        if not super().accepts_curve_types(sketch):
+            return False
+
+        id1, id2 = self.curve_id_1, self.curve_id_2
+        if not id1 or not id2:
+            return True
+
+        # An entity cannot be constrained to itself
+        if id1 == id2:
+            return False
+
+        from ..model.constants import SketchCurveType
+        from ..utilities.curve_data import get_curve_data, get_uuid
+
+        cd, idx1, _ = get_curve_data(sketch, id1)
+        _, idx2, _ = get_curve_data(sketch, id2)
+        if cd is None or idx1 is None or idx2 is None:
+            return True
+
+        type_attr = cd.attributes.get("sketch_type")
+        if not type_attr:
+            return True
+
+        t1 = type_attr.data[idx1].value
+        t2 = type_attr.data[idx2].value
+
+        # Point in Line: do not allow distance between a line and its own endpoints
+        if t1 == SketchCurveType.LINE and t2 == SketchCurveType.POINT:
+            if id2 in (
+                get_uuid(cd, "start_point_id", idx1),
+                get_uuid(cd, "end_point_id", idx1),
+            ):
+                return False
+        elif t2 == SketchCurveType.LINE and t1 == SketchCurveType.POINT:
+            if id1 in (
+                get_uuid(cd, "start_point_id", idx2),
+                get_uuid(cd, "end_point_id", idx2),
+            ):
+                return False
+
+        # Center point: do not allow distance between circle/arc and its own center
+        if (
+            t1 in (SketchCurveType.ARC, SketchCurveType.CIRCLE)
+            and t2 == SketchCurveType.POINT
+        ):
+            if id2 == get_uuid(cd, "center_point_id", idx1):
+                return False
+        elif (
+            t2 in (SketchCurveType.ARC, SketchCurveType.CIRCLE)
+            and t1 == SketchCurveType.POINT
+        ):
+            if id1 == get_uuid(cd, "center_point_id", idx2):
+                return False
+
+        return True
+
     def _is_native_3d(self):
         sketch = self._get_sketch()
         return bool(sketch and getattr(sketch, "is_3d", False))
@@ -154,14 +212,18 @@ class SlvsDistance(DimensionalConstraint, PropertyGroup):
         from ..model.constants import SketchCurveType
         from ..utilities.curve_data import get_curve_data, get_curve_position, get_uuid
 
-        h1 = handle_map.get(self.curve_id_1)
-        h2 = handle_map.get(self.curve_id_2)
+        id1, id2 = self.curve_id_1, self.curve_id_2
+        if id1 == id2:
+            return None
+
+        h1 = handle_map.get(id1)
+        h2 = handle_map.get(id2)
         if h1 is None or h2 is None:
             return None
 
         sketch = self._get_sketch()
-        cd, idx1, _ = get_curve_data(sketch, self.curve_id_1)
-        _, idx2, _ = get_curve_data(sketch, self.curve_id_2)
+        cd, idx1, _ = get_curve_data(sketch, id1)
+        _, idx2, _ = get_curve_data(sketch, id2)
         if cd is None:
             return None
 
@@ -169,6 +231,45 @@ class SlvsDistance(DimensionalConstraint, PropertyGroup):
 
         t1 = type_attr.data[idx1].value
         t2 = type_attr.data[idx2].value if idx2 is not None else -1
+
+        # Point in Line: reject distance between a line and its own endpoints
+        if t1 == SketchCurveType.LINE and t2 == SketchCurveType.POINT:
+            if id2 in (
+                get_uuid(cd, "start_point_id", idx1),
+                get_uuid(cd, "end_point_id", idx1),
+            ):
+                return None
+        elif t2 == SketchCurveType.LINE and t1 == SketchCurveType.POINT:
+            if id1 in (
+                get_uuid(cd, "start_point_id", idx2),
+                get_uuid(cd, "end_point_id", idx2),
+            ):
+                return None
+
+        # Center point: reject distance between circle/arc and its own center
+        if (
+            t1 in (SketchCurveType.ARC, SketchCurveType.CIRCLE)
+            and t2 == SketchCurveType.POINT
+        ):
+            if id2 == get_uuid(cd, "center_point_id", idx1):
+                return None
+        elif (
+            t2 in (SketchCurveType.ARC, SketchCurveType.CIRCLE)
+            and t1 == SketchCurveType.POINT
+        ):
+            if id1 == get_uuid(cd, "center_point_id", idx2):
+                return None
+
+        # Normalise curve-first so the curve is always first
+        cid1, cid2 = id1, id2
+        if t1 not in (SketchCurveType.ARC, SketchCurveType.CIRCLE) and t2 in (
+            SketchCurveType.ARC,
+            SketchCurveType.CIRCLE,
+        ):
+            cid1, cid2 = id2, id1
+            h1, h2 = h2, h1
+            idx1, idx2 = idx2, idx1
+            t1, t2 = t2, t1
 
         value = self.get_value()
 
@@ -223,8 +324,8 @@ class SlvsDistance(DimensionalConstraint, PropertyGroup):
         if t2 == SketchCurveType.POINT:
             alignment = self.align
             if self.use_align() and alignment != "NONE":
-                p1_pos = get_curve_position(sketch, self.curve_id_1)
-                p2_pos = get_curve_position(sketch, self.curve_id_2)
+                p1_pos = get_curve_position(sketch, cid1)
+                p2_pos = get_curve_position(sketch, cid2)
                 if p1_pos and p2_pos:
                     p = solvesys.add_point_2d(group, p2_pos[0], p1_pos[1], wp)
                     handles = []
@@ -279,7 +380,13 @@ class SlvsDistance(DimensionalConstraint, PropertyGroup):
     def create_slvs_data(self, solvesys, group=Solver.group_fixed):
         if self.entity1 == self.entity2:
             raise AttributeError("Cannot create constraint between one entity itself")
-        # TODO: don't allow Distance if Point -> Line if (Point in Line)
+        if self.entity1 and self.entity2:
+            if self.entity1.is_line() and self.entity2.is_point():
+                if self.entity2 in (self.entity1.p1, self.entity1.p2):
+                    raise AttributeError("Cannot create distance between line and its endpoint")
+            elif self.entity1.is_point() and self.entity2.is_line():
+                if self.entity1 in (self.entity2.p1, self.entity2.p2):
+                    raise AttributeError("Cannot create distance between point and its line")
 
         e1, e2 = self.entity1, self.entity2
         if e1.is_line():
